@@ -741,7 +741,7 @@ except Exception:
 AGENCY_NAME = "C-8"
 SYSTEM_NAME = "Console"
 # r20: GreyNoise Community integrated into Analyze; 404=no-record handling; verified scan rows synchronized.
-APP_VERSION = "3.46.0-c8-integrated-hardening-r115"
+APP_VERSION = "3.46.0-c8-integrated-hardening-r116"
 
 
 # ============================================================================
@@ -32641,7 +32641,8 @@ body.theme-dark .black-cloud-member.active{background:#10233a;border-color:#4c6f
     .c8-no-screenshots{position:fixed;z-index:10000;right:10px;bottom:10px;padding:6px 10px;border:2px solid #fff;background:#8a1f1f;color:#fff;box-shadow:0 4px 18px #0006;font:800 .74rem/1.25 Arial,sans-serif;letter-spacing:.03em;pointer-events:none}
     .c8-privacy-controls{display:grid;gap:10px}.c8-privacy-controls label{display:flex;align-items:flex-start;gap:10px;cursor:pointer;line-height:1.4}.c8-privacy-controls input[type="checkbox"]{width:18px;height:18px;flex:none;margin:1px 0}.c8-privacy-controls p{margin:0;color:var(--muted)}
     .c8-privacy-value{display:inline-block;max-width:100%;vertical-align:baseline;white-space:pre-wrap;overflow-wrap:anywhere}.c8-privacy-blur .c8-privacy-value:not(:hover):not(:focus):not([data-c8-revealed="true"]){filter:blur(7px);user-select:none;-webkit-user-select:none;cursor:pointer}.c8-privacy-blur .c8-privacy-field:not(:hover):not(:focus){filter:blur(7px)}
-    @media print{body > *{display:none!important}body::before{content:"SENSITIVE — Printing this console is disabled.";display:block!important;padding:24px;font:18pt Arial,sans-serif;color:#000;background:#fff}}
+    body.c8-capture-veil::after{content:"SENSITIVE CONTENT HIDDEN WHILE THE WINDOW IS INACTIVE";position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:24px;text-align:center;background:#071a33;color:#fff;font:800 clamp(1rem,3vw,1.5rem)/1.4 Arial,sans-serif;letter-spacing:.06em;pointer-events:none}
+    @media print{body > *{display:none!important}body::before{content:"SENSITIVE — Printing this console is disabled.";display:block!important;padding:24px;font:18pt Arial,sans-serif;color:#000;background:#fff}body::after{display:none!important}}
 </style>
   <link rel="stylesheet" href="/assets/dome/leaflet.css?v=c8-dome-2" />
   <link rel="stylesheet" href="/assets/dome/leaflet.draw.css?v=c8-dome-2" />
@@ -32671,6 +32672,29 @@ const MODULES = ["Overview","IP Forensics","Connectivity Assessment","IP Databas
 const state = { current: "Overview", theme: "dark", csrf: null, authenticated: false, role: "operator", isAdmin: false, username: "", userId: null, privacyBlur: false };
 const C8_BOOTSTRAP_SESSION = __C8_BOOTSTRAP_SESSION__;
 function $(id){ return document.getElementById(id); }
+// A best-effort visual veil. Browser code cannot stop operating-system capture.
+let c8CaptureWindowFocused=true;
+let c8CaptureHoldUntil=0;
+let c8CaptureHoldTimer=null;
+function c8CaptureVeilSync(){
+  const hold=Math.max(0,c8CaptureHoldUntil-Date.now());
+  document.body.classList.toggle('c8-capture-veil',document.visibilityState==='hidden'||!c8CaptureWindowFocused||hold>0);
+  if(c8CaptureHoldTimer){clearTimeout(c8CaptureHoldTimer);c8CaptureHoldTimer=null;}
+  if(hold>0)c8CaptureHoldTimer=setTimeout(c8CaptureVeilSync,hold+30);
+}
+window.addEventListener('blur',()=>{c8CaptureWindowFocused=false;c8CaptureVeilSync();});
+window.addEventListener('focus',()=>{c8CaptureWindowFocused=true;c8CaptureVeilSync();});
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'&&typeof document.hasFocus==='function'&&document.hasFocus())c8CaptureWindowFocused=true;
+  c8CaptureVeilSync();
+});
+document.addEventListener('keydown',event=>{
+  if(event.key!=='PrintScreen'&&event.code!=='PrintScreen')return;
+  event.preventDefault();
+  c8CaptureHoldUntil=Date.now()+2000;
+  c8CaptureVeilSync();
+},true);
+c8CaptureVeilSync();
 function toggleOfficialSiteHow(forceOpen){
   const panel=$('us-site-banner-how'),button=$('us-site-banner-how-toggle');
   if(!panel||!button)return;
@@ -41814,7 +41838,7 @@ def _c8_shop_proxy_request(handler: Any, mount_prefix: str = "") -> None:
         handler.send_response(503)
         handler.send_header("Content-Type", "text/plain; charset=utf-8")
         handler.send_header("Cache-Control", "no-store")
-        handler.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), browsing-topics=(), interest-cohort=()")
+        handler.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), display-capture=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), browsing-topics=(), interest-cohort=()")
         handler.send_header("Cross-Origin-Opener-Policy", "same-origin")
         handler.send_header("Cross-Origin-Resource-Policy", "same-origin")
         handler.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; trusted-types default; require-trusted-types-for 'script'")
@@ -41839,7 +41863,7 @@ def _c8_shop_proxy_request(handler: Any, mount_prefix: str = "") -> None:
         body = b"Request body is too large for C-8 Shop."
         handler.send_response(413)
         handler.send_header("Content-Type", "text/plain; charset=utf-8")
-        handler.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), browsing-topics=(), interest-cohort=()")
+        handler.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), display-capture=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), browsing-topics=(), interest-cohort=()")
         handler.send_header("Cross-Origin-Opener-Policy", "same-origin")
         handler.send_header("Cross-Origin-Resource-Policy", "same-origin")
         handler.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; trusted-types default; require-trusted-types-for 'script'")
@@ -41941,7 +41965,7 @@ def _c8_shop_proxy_request(handler: Any, mount_prefix: str = "") -> None:
         seen = {str(k).lower() for k, _ in response_headers}
         for key, value in response_headers:
             lower = str(key).lower()
-            if lower in {"server", "date", "connection", "transfer-encoding", "content-length"}:
+            if lower in {"server", "date", "connection", "transfer-encoding", "content-length", "permissions-policy"}:
                 continue
             out_value = str(value)
             if lower == "location" and prefix:
@@ -41965,12 +41989,11 @@ def _c8_shop_proxy_request(handler: Any, mount_prefix: str = "") -> None:
             handler.send_header("X-Content-Type-Options", "nosniff")
         if "referrer-policy" not in seen:
             handler.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
-        if "permissions-policy" not in seen:
-            handler.send_header(
-                "Permissions-Policy",
-                "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), "
-                "bluetooth=(), hid=(), browsing-topics=(), interest-cohort=()"
-            )
+        handler.send_header(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), display-capture=(), payment=(), usb=(), serial=(), "
+            "bluetooth=(), hid=(), browsing-topics=(), interest-cohort=()"
+        )
         if "cross-origin-opener-policy" not in seen:
             handler.send_header("Cross-Origin-Opener-Policy", "same-origin")
         if "cross-origin-resource-policy" not in seen:
@@ -42688,7 +42711,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Origin-Agent-Cluster", "?1")
         self.send_header("X-C8-Audit-Protection", "AES-256-GCM+HMAC-SHA256" if len(_audit_field_aes256_key()) == 32 else "HMAC-SHA256")
         self.send_header("Accept-CH", "Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model")
-        self.send_header("Permissions-Policy", "camera=(), microphone=(self), geolocation=(self), payment=(), usb=(), serial=(), bluetooth=(), hid=(), browsing-topics=(), interest-cohort=()")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(self), geolocation=(self), display-capture=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), browsing-topics=(), interest-cohort=()")
         csp = _content_security_policy(csp_nonce)
         self.send_header("Content-Security-Policy", csp)
         if TLS_REQUIRE_HTTPS or self._request_is_tls():
