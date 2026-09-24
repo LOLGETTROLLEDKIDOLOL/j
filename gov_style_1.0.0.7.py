@@ -733,7 +733,7 @@ except Exception:
 AGENCY_NAME = "C-8"
 SYSTEM_NAME = "Console"
 # r20: GreyNoise Community integrated into Analyze; 404=no-record handling; verified scan rows synchronized.
-APP_VERSION = "3.46.0-c8-integrated-hardening-r109"
+APP_VERSION = "3.46.0-c8-integrated-hardening-r111"
 
 
 # ============================================================================
@@ -3346,6 +3346,27 @@ def _normalize_ban_subject(value: Any) -> str:
         raise ValueError("Enter one valid IP address or CIDR network.") from exc
 
 
+# Exact addresses the operator supplied on 2026-09-24. Only the explicit
+# --restore-operator-bans command imports them; startup never re-adds a ban.
+_OPERATOR_BANS_2026_09_24 = tuple("""
+144.172.105.41 194.233.84.90 31.132.90.3 178.62.252.164
+94.154.46.244 40.76.252.140 195.96.139.107 45.63.4.69
+45.127.73.6 194.24.161.104 201.79.0.176 201.79.6.182
+209.38.194.23 209.38.199.55 209.38.204.16 209.38.217.244
+212.102.40.218 185.12.59.117 172.235.41.110 172.110.223.252
+167.99.93.212 165.245.249.61 165.245.212.20 164.92.247.156
+164.92.207.74 161.35.221.174 160.119.76.210 157.230.103.116
+147.185.132.150 144.202.82.88 159.223.26.113 69.164.217.245
+64.62.156.107 64.62.156.106 64.62.156.105 64.62.156.104
+64.62.156.103 64.62.156.101 64.62.156.99 64.62.156.98
+64.62.156.97 64.62.156.96 64.62.156.95 64.62.156.94
+47.77.228.238 47.254.39.203 47.130.108.237 47.89.246.29
+45.79.181.251 45.79.115.59 43.130.131.18 43.130.3.120
+40.124.172.70 38.240.225.120 34.208.194.230 34.38.176.89
+194.24.161.10 45.33.72.207
+""".split())
+
+
 def _save_ip_banlist_locked() -> None:
     global _IP_BANLIST_MTIME_NS, _IP_BANLIST_LOAD_ERROR
     IP_BANLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -3455,6 +3476,7 @@ def list_banned_ips() -> Dict[str, Any]:
         "bans": rows,
         "history": history_rows,
         "state_file": str(IP_BANLIST_PATH),
+        "state_file_exists": IP_BANLIST_PATH.is_file(),
         "encrypted": _local_state_aes_available(),
         "reload": "automatic",
         "load_error": _IP_BANLIST_LOAD_ERROR,
@@ -3476,6 +3498,8 @@ def _ip_ban_operator() -> Dict[str, str]:
 
 def ban_ip(subject: Any, reason: str = "", duration_seconds: int = 0) -> Dict[str, Any]:
     _load_ip_banlist()
+    if _IP_BANLIST_LOAD_ERROR:
+        raise RuntimeError(f"Existing ban state cannot be read; restore its key first: {_IP_BANLIST_LOAD_ERROR}")
     clean = _normalize_ban_subject(subject)
     now = time.time()
     duration = max(0, min(int(duration_seconds or 0), 365 * 24 * 60 * 60))
@@ -3504,22 +3528,160 @@ def ban_ip(subject: Any, reason: str = "", duration_seconds: int = 0) -> Dict[st
     return {"ok": True, "status": "banned", "ban": row, "firewall": _sync_ip_firewall_bans()}
 
 
-def unban_ip(subject: Any) -> Dict[str, Any]:
+def unban_ip(subject: Any, *, operator: str = "", source: str = "server-cli") -> Dict[str, Any]:
     _load_ip_banlist()
+    if _IP_BANLIST_LOAD_ERROR:
+        raise RuntimeError(f"Existing ban state cannot be read; restore its key first: {_IP_BANLIST_LOAD_ERROR}")
     clean = _normalize_ban_subject(subject)
     with _IP_BANLIST_LOCK:
         removed = _IP_BANLIST.pop(clean, None)
+        actor = _ip_ban_operator()
+        if operator:
+            actor["operator"] = str(operator)[:120]
         _IP_BAN_HISTORY.append({
             "action": "unbanned" if removed else "unban_not_found",
             "subject": clean,
             "reason": str((removed or {}).get("reason") or "")[:500],
             "created_at": now_iso(),
-            **_ip_ban_operator(),
+            "source": str(source)[:50],
+            **actor,
         })
         del _IP_BAN_HISTORY[:-500]
         _save_ip_banlist_locked()
     return {"ok": bool(removed), "status": "unbanned" if removed else "not_found", "subject": clean,
             "firewall": _sync_ip_firewall_bans()}
+
+
+def _parse_web_ip_ban_subjects(raw: Any) -> List[str]:
+    if isinstance(raw, str):
+        value = raw
+    elif isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+        value = "\n".join(raw)
+    else:
+        raise C8SecurityInputError("Enter IP addresses or CIDR networks as text.")
+    if not value.strip() or len(value) > 16000:
+        raise C8SecurityInputError("Enter 1 to 256 IP addresses or CIDR networks (maximum 16,000 characters).")
+    parts = [part for part in re.split(r"[,;\s]+", value.strip()) if part]
+    if len(parts) > 256:
+        raise C8SecurityInputError("A bulk ban can contain at most 256 IPs or CIDR networks.")
+    subjects: List[str] = []
+    seen: set[str] = set()
+    for index, part in enumerate(parts, 1):
+        try:
+            subject = _normalize_ban_subject(part)
+        except ValueError as exc:
+            raise C8SecurityInputError(f"Invalid IP or CIDR at item {index}: {part[:80]}") from exc
+        if subject not in seen:
+            subjects.append(subject)
+            seen.add(subject)
+    return subjects
+
+
+def ban_ips_from_site(raw: Any, *, reason: Any = "", duration_seconds: Any = 0,
+                      operator: str = "", protected_ips: Any = ()) -> Dict[str, Any]:
+    """Validate the entire batch before one encrypted save and one firewall sync."""
+    subjects = _parse_web_ip_ban_subjects(raw)
+    reason_text = str(reason or "server operator ban").strip()
+    if not reason_text or len(reason_text) > 500 or "\x00" in reason_text:
+        raise C8SecurityInputError("The ban reason must be 1 to 500 characters.")
+    if isinstance(duration_seconds, bool) or not re.fullmatch(r"\d{1,9}", str(duration_seconds)):
+        raise C8SecurityInputError("Select a valid ban duration in seconds.")
+    duration = int(duration_seconds)
+    if duration > 365 * 24 * 60 * 60:
+        raise C8SecurityInputError("A temporary ban cannot exceed one year.")
+    protected = []
+    for value in protected_ips:
+        try:
+            protected.append(ipaddress.ip_address(str(value)))
+        except ValueError:
+            continue
+    for subject in subjects:
+        network = ipaddress.ip_network(subject, strict=False)
+        if any(address.version == network.version and address in network for address in protected):
+            raise C8SecurityInputError("This ban would block your current admin connection. Use the server CLI from another network if that is intentional.")
+    ban_report = list_banned_ips()  # Also expire old entries before duplicate checks.
+    if not ban_report["ok"]:
+        raise RuntimeError(f"Existing ban state cannot be read; restore its key first: {ban_report['load_error']}")
+    now = time.time()
+    created = now_iso()
+    actor = _ip_ban_operator()
+    actor["operator"] = str(operator or "site-admin")[:120]
+    added: List[str] = []
+    with _IP_BANLIST_LOCK:
+        previous_history = list(_IP_BAN_HISTORY)
+        try:
+            for subject in subjects:
+                if subject in _IP_BANLIST:
+                    continue
+                row = {
+                    "subject": subject, "reason": reason_text,
+                    "created_at": created, "created_at_epoch": now,
+                    "expires_at": _epoch_iso(now + duration) if duration else "",
+                    "expires_at_epoch": now + duration if duration else 0,
+                    "source": "admin-web",
+                }
+                _IP_BANLIST[subject] = row
+                _IP_BAN_HISTORY.append({
+                    "action": "banned", "subject": subject,
+                    "reason": reason_text, "created_at": created,
+                    "expires_at": row["expires_at"], "source": "admin-web", **actor,
+                })
+                added.append(subject)
+            if added:
+                _save_ip_banlist_locked()
+                del _IP_BAN_HISTORY[:-500]
+        except Exception:
+            for subject in added:
+                _IP_BANLIST.pop(subject, None)
+            _IP_BAN_HISTORY[:] = previous_history
+            raise
+    firewall = _sync_ip_firewall_bans()
+    return {
+        "ok": True, "added": len(added),
+        "already_banned": len(subjects) - len(added),
+        "requested": len(subjects), "bans": added,
+        "state_file": str(IP_BANLIST_PATH), "firewall": firewall,
+    }
+
+
+def restore_operator_bans() -> Dict[str, Any]:
+    """Recover the pasted operator list in one write without changing other bans."""
+    _load_ip_banlist()
+    if _IP_BANLIST_LOAD_ERROR:
+        raise RuntimeError(f"Existing ban state cannot be read; restore its key first: {_IP_BANLIST_LOAD_ERROR}")
+    subjects = tuple(_normalize_ban_subject(value) for value in _OPERATOR_BANS_2026_09_24)
+    if len(subjects) != len(set(subjects)):
+        raise RuntimeError("The embedded operator ban list has duplicate addresses.")
+    now = time.time()
+    created = now_iso()
+    added = 0
+    with _IP_BANLIST_LOCK:
+        for subject in subjects:
+            if subject in _IP_BANLIST:
+                continue
+            row = {
+                "subject": subject, "reason": "server operator ban",
+                "created_at": created, "created_at_epoch": now,
+                "expires_at": "", "expires_at_epoch": 0,
+                "source": "operator-list-restored",
+            }
+            _IP_BANLIST[subject] = row
+            _IP_BAN_HISTORY.append({
+                "action": "restored", "subject": subject,
+                "reason": row["reason"], "created_at": created,
+                "expires_at": "", **_ip_ban_operator(),
+            })
+            added += 1
+        if added:
+            del _IP_BAN_HISTORY[:-500]
+            _save_ip_banlist_locked()
+    firewall = _sync_ip_firewall_bans()
+    return {
+        "ok": bool(firewall.get("ok") and firewall.get("active")),
+        "restored": added, "already_banned": len(subjects) - added,
+        "total_pasted": len(subjects), "state_file": str(IP_BANLIST_PATH),
+        "firewall": firewall,
+    }
 
 
 def _ip_ban_match(value: Any) -> Optional[Dict[str, Any]]:
@@ -3647,6 +3809,8 @@ def _sync_ip_firewall_bans() -> Dict[str, Any]:
         status: Dict[str, Any] = {
             "ok": False, "active": False, "backend": "nftables",
             "count": 0, "ports": ports, "error": "",
+            "state_file": str(IP_BANLIST_PATH),
+            "state_file_exists": IP_BANLIST_PATH.is_file(),
         }
         try:
             report = list_banned_ips()
@@ -3657,6 +3821,8 @@ def _sync_ip_firewall_bans() -> Dict[str, Any]:
             status["count"] = len(subjects)
             status["configured_count"] = int(report["count"])
             status["disabled"] = not enabled
+            if enabled and not subjects and not IP_BANLIST_PATH.is_file():
+                raise RuntimeError("No saved ban file exists at this path; no firewall rules changed. Check this script's .env or use --restore-operator-bans to import the pasted IPs.")
             if os.name != "posix" or not sys.platform.startswith("linux"):
                 raise RuntimeError("Kernel firewall enforcement requires Linux; application bans remain active.")
             if getattr(os, "geteuid", lambda: 1)() != 0:
@@ -5009,6 +5175,8 @@ def _create_session(client: str, user: Optional[Dict[str, Any]] = None, user_age
 
 
 SENSITIVE_ADMIN_PATHS = {
+    "/api/admin/ip-bans/add",
+    "/api/admin/ip-bans/remove",
     "/api/admin/ipdb-redact",
     "/api/admin/optout-verify",
     "/api/admin/create-user",
@@ -37070,7 +37238,7 @@ function adminSecurityPaint(){
   const bans=(adminSecurityCache.persistent_ip_bans||[]).filter(b=>!q||pretty(b).toLowerCase().includes(q));
   const ipFirewall=adminSecurityCache.persistent_ip_firewall||{};
   const ipFirewallMessage=ipFirewall.active&&ipFirewall.ok?`Kernel firewall active: ${Number(ipFirewall.count||0)} IPs/networks blocked on TCP ${(ipFirewall.ports||[]).join(', ')}. SSH unaffected.`:`Kernel firewall ${ipFirewall.error?'sync failed':'inactive'}: ${esc(ipFirewall.error||(ipFirewall.disabled?'disabled by LL_WEB_IP_FIREWALL=0':'No firewall rules needed.'))} ${ipFirewall.last_known_active?'Previous firewall rules may still apply.':'Application bans still return HTTP 403.'}`;
-  const banRows=bans.length?bans.map(b=>`<tr><td>${securityCode(b.subject||'N/A','ip')}</td><td>${esc(b.reason||'server policy')}</td><td>${esc(b.created_at||'N/A')}</td><td>${esc(b.expires_at||'Permanent')}</td><td>${securityChip(b.source||'server-cli','high')}</td></tr>`).join(''):'<tr><td colspan="5">No persistent server-side IP bans.</td></tr>';
+  const banRows=bans.length?bans.map(b=>`<tr><td>${securityCode(b.subject||'N/A','ip')}</td><td>${esc(b.reason||'server policy')}</td><td>${esc(b.created_at||'N/A')}</td><td>${esc(b.expires_at||'Permanent')}</td><td>${securityChip(b.source||'server-cli','high')}</td><td><button class="secondary-btn" type="button" data-subject="${esc(b.subject||'')}" onclick="adminSecurityUnban(this.dataset.subject)">Unban</button></td></tr>`).join(''):'<tr><td colspan="6">No persistent server-side IP bans.</td></tr>';
   const banHistory=(adminSecurityCache.persistent_ip_ban_history||[]).filter(b=>!q||pretty(b).toLowerCase().includes(q));
   const banHistoryRows=banHistory.length?banHistory.map(b=>`<tr><td>${esc(b.created_at||'N/A')}</td><td>${securityChip(b.action||'changed',b.action==='unbanned'?'ok':'high')}</td><td>${securityCode(b.subject||'N/A','ip')}</td><td>${esc(b.reason||'N/A')}</td><td>${esc(b.operator||'server-operator')}</td><td>${esc(b.server||'N/A')}</td></tr>`).join(''):'<tr><td colspan="6">No VPS ban changes have been recorded.</td></tr>';
   const eventRows=events.length?events.map(e=>{
@@ -37090,7 +37258,52 @@ function adminSecurityPaint(){
   }).join(''):'<tr><td colspan="7">No active login guards.</td></tr>';
   const integrityTables=((adminSecurityCache.audit_integrity||{}).tables)||{};
   const integrityRows=Object.keys(integrityTables).length?Object.entries(integrityTables).map(([name,row])=>{const mismatch=Number(row.mismatch||0)+Number(row.unknown_algorithm||0);const legacy=Number(row.legacy_unsigned||0);const status=row.columns_present?(mismatch?securityChip('Mismatch','critical'):(legacy?securityChip('Mixed','medium'):securityChip('Verified','ok'))):securityChip('No columns','medium');return `<tr><td>${securityCode(name,'subject')}</td><td>${status}</td><td>${esc(row.verified??0)}</td><td>${securityCount(row.mismatch??0,1,1)}</td><td>${legacy?securityChip(String(legacy),'medium'):esc(0)}</td><td>${esc(row.sampled??0)}</td></tr>`;}).join(''):'<tr><td colspan="6">No integrity sample available.</td></tr>';
-  root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p><p class="tiny ${ipFirewall.active&&ipFirewall.ok?'ok':'bad'}">${ipFirewallMessage}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Mismatch</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
+  root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th><th>Action</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p><p class="tiny ${ipFirewall.active&&ipFirewall.ok?'ok':'bad'}">${ipFirewallMessage}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Mismatch</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
+}
+let adminBanRequestBusy=false;
+function adminBanFeedback(message,failed=false){
+  const el=$('admin-ban-feedback');if(!el)return;
+  el.textContent=String(message||'');
+  el.className=failed?'tiny bad':'tiny ok';
+}
+async function adminSecurityBan(bulk=false){
+  if(!state.isAdmin){showLogin('Admin role required.');return;}
+  if(adminBanRequestBusy)return;
+  const input=$(bulk?'admin-ban-bulk':'admin-ban-single');
+  const subjects=String(input?.value||'').trim();
+  if(!subjects){adminBanFeedback('Enter an IP address or CIDR network.',true);return;}
+  const candidateCount=subjects.split(/[\s,;]+/).filter(Boolean).length;
+  if(bulk&&!confirm(`Ban ${candidateCount} supplied IPs/networks? Every entry must be valid.`))return;
+  const reason=String($('admin-ban-reason')?.value||'').trim();
+  const duration_seconds=Number($('admin-ban-duration')?.value||0);
+  adminBanRequestBusy=true;
+  adminBanFeedback('Saving bans and syncing the VPS firewall...');
+  try{
+    const data=await api('/api/admin/ip-bans/add',{subjects,reason,duration_seconds},{timeoutMs:180000});
+    if(input)input.value='';
+    await adminSecurityLoad(true);
+    const fw=data.firewall||{};
+    if(fw.ok&&fw.active){
+      adminBanFeedback(`Banned ${data.added} IPs/networks. ${data.already_banned} were already banned. VPS firewall active on TCP ${(fw.ports||[]).join(', ')}.`);
+    }else{
+      adminBanFeedback(`Saved ${data.added} bans, but VPS firewall sync failed: ${fw.error||'firewall inactive'}. Site requests are still blocked by the ban list.`,true);
+    }
+  }catch(e){adminBanFeedback(e.message||String(e),true);}
+  finally{adminBanRequestBusy=false;}
+}
+async function adminSecurityUnban(subject){
+  if(!state.isAdmin){showLogin('Admin role required.');return;}
+  if(adminBanRequestBusy)return;
+  const clean=String(subject||'').trim();if(!clean)return;
+  if(!confirm(`Remove the ban for ${clean}?`))return;
+  adminBanRequestBusy=true;
+  try{
+    const data=await api('/api/admin/ip-bans/remove',{subject:clean},{timeoutMs:45000});
+    await adminSecurityLoad(true);
+    const fw=data.firewall||{};
+    adminBanFeedback(fw.ok?`Unbanned ${clean}. Firewall updated.`:`Ban removed from the site, but firewall sync failed: ${fw.error||'unknown error'}.`,!fw.ok);
+  }catch(e){adminBanFeedback(e.message||String(e),true);}
+  finally{adminBanRequestBusy=false;}
 }
 async function adminSecurityLoad(showErrors=true){
   if(!state.isAdmin){showLogin('Admin role required.');return;}
@@ -37104,7 +37317,7 @@ async function adminSecurityLoad(showErrors=true){
     adminSecurityPaint();
   }catch(e){if(root&&showErrors)root.innerHTML=`<div class="online-users-error">${esc(e.message||String(e))}</div>`;}
 }
-RENDER['Security']=()=>`<div class="module-note">Administrator-only security monitoring. Shows login throttling, password-spray detection, distributed brute-force signals, blocked requests, invalid origins/CSRF tokens, unsupported methods, unknown-path probes, TLS/request metadata, and active guard state. Raw passwords are never stored.</div><div class="admin-users-summary"><div class="stat"><strong id="security-event-count">0</strong><span>Recent events</span></div><div class="stat"><strong id="security-failed-count">0</strong><span>Failed logins</span></div><div class="stat"><strong id="security-block-count">0</strong><span>Login guards</span></div><div class="stat"><strong id="security-net-block-count">0</strong><span>Net blocks</span></div><div class="stat"><strong id="security-critical-count">0</strong><span>Critical events</span></div></div><div class="card"><div class="form-grid"><div class="field"><label>Search security logs</label><input id="admin-security-search" placeholder="IP, username, event, path, TLS, browser" oninput="adminSecurityPaint()"></div><div class="field"><label>&nbsp;</label><div class="actions" style="margin:0"><button class="secondary-btn" onclick="adminSecurityLoad(true)">Refresh Security</button></div></div></div><details><summary>Active security configuration</summary><pre id="admin-security-config" class="hardware-lines">Waiting</pre></details><p class="muted">Last generated: <span id="admin-security-time">Waiting</span></p></div><div id="admin-security-result"><div class="users-empty">Loading security events...</div></div>`;
+RENDER['Security']=()=>`<div class="module-note">Administrator-only security monitoring. Shows login throttling, password-spray detection, distributed brute-force signals, blocked requests, invalid origins/CSRF tokens, unsupported methods, unknown-path probes, TLS/request metadata, and active guard state. Raw passwords are never stored.</div><div class="admin-users-summary"><div class="stat"><strong id="security-event-count">0</strong><span>Recent events</span></div><div class="stat"><strong id="security-failed-count">0</strong><span>Failed logins</span></div><div class="stat"><strong id="security-block-count">0</strong><span>Login guards</span></div><div class="stat"><strong id="security-net-block-count">0</strong><span>Net blocks</span></div><div class="stat"><strong id="security-critical-count">0</strong><span>Critical events</span></div></div><div class="card"><div class="form-grid"><div class="field"><label>Search security logs</label><input id="admin-security-search" placeholder="IP, username, event, path, TLS, browser" oninput="adminSecurityPaint()"></div><div class="field"><label>&nbsp;</label><div class="actions" style="margin:0"><button class="secondary-btn" onclick="adminSecurityLoad(true)">Refresh Security</button></div></div></div><details><summary>Active security configuration</summary><pre id="admin-security-config" class="hardware-lines">Waiting</pre></details><p class="muted">Last generated: <span id="admin-security-time">Waiting</span></p></div><div class="card"><h3>Manage VPS IP bans</h3><p class="muted">Admin only. Bans block this site's HTTP and HTTPS ports; the server CLI remains available for recovery.</p><div class="form-grid"><div class="field"><label for="admin-ban-single">IP address or CIDR</label><input id="admin-ban-single" placeholder="203.0.113.42 or 203.0.113.0/24" maxlength="100"></div><div class="field"><label for="admin-ban-reason">Reason</label><input id="admin-ban-reason" value="server operator ban" maxlength="500"></div><div class="field"><label for="admin-ban-duration">Duration</label><select id="admin-ban-duration"><option value="0">Permanent</option><option value="3600">1 hour</option><option value="86400">1 day</option><option value="604800">7 days</option><option value="2592000">30 days</option><option value="31536000">365 days</option></select></div></div><div class="actions" style="margin:12px 0"><button type="button" onclick="adminSecurityBan(false)">Ban IP / CIDR</button></div><div class="field"><label for="admin-ban-bulk">Bulk ban IPs / CIDRs</label><textarea id="admin-ban-bulk" rows="5" maxlength="16000" style="width:100%;resize:vertical" placeholder="One IP or CIDR per line. Commas and spaces also work. Up to 256 per submission."></textarea></div><div class="actions" style="margin:12px 0"><button type="button" onclick="adminSecurityBan(true)">Ban pasted list</button></div><p id="admin-ban-feedback" class="tiny" role="status" aria-live="polite"></p></div><div id="admin-security-result"><div class="users-empty">Loading security events...</div></div>`;
 
 let adminOptoutCache={requests:[],status_counts:{}};
 function adminOptoutStatusChip(status){
@@ -38395,7 +38608,7 @@ def _print_startup_diagnostics() -> None:
         f"{'enabled' if black_cloud_configuration['proxy_enabled'] else 'disabled'}.",
         flush=True,
     )
-    print("- Tools: --security-check, --tls-cert PATH --tls-key PATH, --mysql-ca PATH, --digitalocean-database-id UUID, --auth-diagnose [username], --create-user USERNAME [--admin], --remove-user USERNAME, --online-users, --ban-ip IP [--reason TEXT] [--ban-seconds N], --unban-ip IP, --list-banned-ips, --sync-firewall-bans, --privacy-purge-ip IP, --ipdb-count, --ipdb-import [path].", flush=True)
+    print("- Tools: --security-check, --tls-cert PATH --tls-key PATH, --mysql-ca PATH, --digitalocean-database-id UUID, --auth-diagnose [username], --create-user USERNAME [--admin], --remove-user USERNAME, --online-users, --ban-ip IP [--reason TEXT] [--ban-seconds N], --unban-ip IP, --list-banned-ips, --sync-firewall-bans, --restore-operator-bans, --privacy-purge-ip IP, --ipdb-count, --ipdb-import [path].", flush=True)
     print("- Deny env: LL_WEB_DENY_CLIENT_CIDRS, LL_WEB_BLOCK_USER_AGENTS, LL_WEB_GOV_DENY_CIDRS, LL_WEB_BLOCK_GOV_NETWORKS=1, LL_WEB_GOV_RDAP_LOOKUP=1.", flush=True)
     print("- Keep this process running. If it stops, browsers get ERR_CONNECTION_REFUSED.", flush=True)
     print("=" * 72, flush=True)
@@ -42869,6 +43082,39 @@ class Handler(BaseHTTPRequestHandler):
                     visitor_window = LIVE_VISITOR_WINDOW_SECONDS
                 self._json(200, admin_live_overview(limit=limit, visitor_window_seconds=visitor_window))
                 return
+            if path == "/api/admin/ip-bans/add":
+                result = ban_ips_from_site(
+                    payload.get("subjects", payload.get("subject", "")),
+                    reason=payload.get("reason", ""),
+                    duration_seconds=payload.get("duration_seconds", 0),
+                    operator=str(session.get("username") or "site-admin"),
+                    protected_ips=(client, self._socket_client_ip()),
+                )
+                record_security_event(
+                    "admin_ip_bans_added", client, severity="high",
+                    username_attempted=str(session.get("username") or ""),
+                    request_method="POST", request_path=path, user_agent=user_agent,
+                    details={"added": result["added"], "already_banned": result["already_banned"],
+                             "subjects": result["bans"][:256], "firewall": result["firewall"],
+                             "request": self._request_metadata()}, force=True,
+                )
+                self._json(200, result)
+                return
+            if path == "/api/admin/ip-bans/remove":
+                result = unban_ip(
+                    payload.get("subject", ""),
+                    operator=str(session.get("username") or "site-admin"), source="admin-web",
+                )
+                record_security_event(
+                    "admin_ip_ban_removed", client, severity="high",
+                    username_attempted=str(session.get("username") or ""),
+                    request_method="POST", request_path=path, user_agent=user_agent,
+                    details={"subject": result["subject"], "removed": result["ok"],
+                             "firewall": result["firewall"], "request": self._request_metadata()},
+                    force=True,
+                )
+                self._json(200 if result["ok"] else 404, result)
+                return
             if path == "/api/admin/security":
                 if str(session.get("role") or "").lower() != "admin":
                     record_security_event("admin_endpoint_denied", client, severity="high", username_attempted=str(session.get("username") or ""), request_method="POST", request_path=path, user_agent=user_agent, details={"request": self._request_metadata()})
@@ -43555,8 +43801,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if AESGCM is None or not LOCAL_STATE_AES_ENABLED:
         raise SystemExit("Encrypted local storage requires cryptography and LL_WEB_LOCAL_STATE_AES256=1.")
     _local_state_aes_key()  # Validate existing key without silently rotating it.
+    if "--restore-operator-bans" in argv:
+        try:
+            result = restore_operator_bans()
+            print(json.dumps(json_safe(result, max_str=5000), ensure_ascii=False, indent=2), flush=True)
+            return 0 if result.get("ok") else 2
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e), "state_file": str(IP_BANLIST_PATH)}, ensure_ascii=False, indent=2), file=sys.stderr, flush=True)
+            return 2
     if "--sync-firewall-bans" in argv:
         result = _sync_ip_firewall_bans()
+        if result.get("ok") and not result.get("active") and not result.get("disabled"):
+            result.update(ok=False, error="No IP bans are configured; no IPs were blocked. Use --restore-operator-bans to restore the 58 addresses you supplied.")
         print(json.dumps(json_safe(result, max_str=5000), ensure_ascii=False, indent=2), flush=True)
         return 0 if result.get("ok") else 2
     if "--ban-ip" in argv:
