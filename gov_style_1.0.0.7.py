@@ -41,6 +41,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape, unescape
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -635,6 +636,25 @@ def _c8_read_secret(path):
         os.close(fd)
 
 
+def _c8_load_existing_key(path):
+    path = Path(path)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise RuntimeError("Secret paths must not be symbolic links.")
+    raw = _c8_read_secret(path)
+    if raw.startswith(_LOCAL_STATE_DPAPI_MAGIC):
+        key = _windows_dpapi_transform(base64.b64decode(raw[len(_LOCAL_STATE_DPAPI_MAGIC):].strip(), validate=True), protect=False)
+    elif len(raw) == 32:
+        key = raw  # A binary key may legitimately start/end with whitespace bytes.
+    else:
+        try:
+            key = base64.b64decode(raw.strip(), validate=True)
+        except (ValueError, binascii.Error):
+            raise RuntimeError("Existing encryption key is invalid; restore it from backup.") from None
+    if len(key) != 32:
+        raise RuntimeError("Existing encryption key is invalid; it was not replaced.")
+    return key
+
+
 def _c8_load_or_create_key(path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -652,19 +672,7 @@ def _c8_load_or_create_key(path):
                 pass
         finally:
             stage.unlink(missing_ok=True)
-    raw = _c8_read_secret(path)
-    if raw.startswith(_LOCAL_STATE_DPAPI_MAGIC):
-        key = _windows_dpapi_transform(base64.b64decode(raw[len(_LOCAL_STATE_DPAPI_MAGIC):].strip(), validate=True), protect=False)
-    elif len(raw) == 32:
-        key = raw  # A binary key may legitimately start/end with whitespace bytes.
-    else:
-        try:
-            key = base64.b64decode(raw.strip(), validate=True)
-        except (ValueError, binascii.Error):
-            raise RuntimeError("Existing encryption key is invalid; restore it from backup.") from None
-    if len(key) != 32:
-        raise RuntimeError("Existing encryption key is invalid; it was not replaced.")
-    return key
+    return _c8_load_existing_key(path)
 
 
 def _c8_security_log_text(value):
@@ -733,7 +741,7 @@ except Exception:
 AGENCY_NAME = "C-8"
 SYSTEM_NAME = "Console"
 # r20: GreyNoise Community integrated into Analyze; 404=no-record handling; verified scan rows synchronized.
-APP_VERSION = "3.46.0-c8-integrated-hardening-r111"
+APP_VERSION = "3.46.0-c8-integrated-hardening-r115"
 
 
 # ============================================================================
@@ -7856,6 +7864,8 @@ def remove_auth_user(username: str, hard_delete: bool = False) -> Dict[str, Any]
 
 AUDIT_INTEGRITY_ALGORITHM = "HMAC-SHA256/server-keyed/audit-row-v1"
 AUDIT_INTEGRITY_TABLES = ("audit_events", "security_event_log", "visitor_access_log", "user_activity_log")
+_AUDIT_PREVIOUS_KEY_LOCK = threading.Lock()
+_AUDIT_PREVIOUS_KEY_CACHE: Tuple[str, Tuple[bytes, ...]] = ("", ())
 AUDIT_FIELD_AES256_ENABLED = os.environ.get("LL_WEB_AUDIT_AES256", "1").strip().lower() not in {"0", "false", "no", "off"}
 AUDIT_FIELD_AES256_PREFIX = "C8-AES256-GCM-1:"
 AUDIT_ENCRYPTED_FIELDS: Dict[str, Tuple[str, ...]] = {
@@ -7951,7 +7961,51 @@ def _ensure_audit_integrity_columns(conn: Any) -> None:
             db_execute(conn, f"ALTER TABLE {_db_ident(table)} ADD COLUMN integrity_alg VARCHAR(80)")
 
 
-def _audit_integrity_tag(table: str, row: Dict[str, Any]) -> str:
+def _audit_integrity_key_path() -> Path:
+    return Path.home() / ".c8-console" / "secrets" / "audit_row_integrity_hmac_key"
+
+
+def _audit_previous_hmac_keys() -> Tuple[bytes, ...]:
+    """Old signing keys verify existing rows; only the current key signs new rows."""
+    global _AUDIT_PREVIOUS_KEY_CACHE
+    configured = os.environ.get("LL_WEB_AUDIT_PREVIOUS_HMAC_KEY_PATHS", "").strip()
+    if not configured:
+        return ()
+    with _AUDIT_PREVIOUS_KEY_LOCK:
+        if _AUDIT_PREVIOUS_KEY_CACHE[0] == configured:
+            return _AUDIT_PREVIOUS_KEY_CACHE[1]
+        paths = [path.strip() for path in configured.split(os.pathsep) if path.strip()]
+        if len(paths) > 4:
+            raise RuntimeError("Configure at most four previous audit signing keys.")
+        current = _server_hmac_key("audit_row_integrity_hmac_key")
+        old_keys: List[bytes] = []
+        for name in paths:
+            key = _c8_load_existing_key(Path(name).expanduser())
+            if key != current and key not in old_keys:
+                old_keys.append(key)
+        _AUDIT_PREVIOUS_KEY_CACHE = (configured, tuple(old_keys))
+        return _AUDIT_PREVIOUS_KEY_CACHE[1]
+
+
+def _audit_assert_signing_key_not_lost(conn: Any) -> None:
+    """Do not silently mint a new signing key over existing signed history."""
+    key_path = _audit_integrity_key_path()
+    if key_path.is_symlink() or key_path.parent.is_symlink():
+        raise RuntimeError("Audit signing key path must not be a symbolic link.")
+    if key_path.is_file():
+        return
+    if key_path.exists():
+        raise RuntimeError("Audit signing key path is not a regular file.")
+    for table in AUDIT_INTEGRITY_TABLES:
+        row = db_fetchone(conn, f"SELECT {_db_ident('id')} FROM {_db_ident(table)} WHERE {_db_ident('integrity_tag')} IS NOT NULL AND {_db_ident('integrity_tag')} <> '' LIMIT 1")
+        if row:
+            raise RuntimeError(
+                f"Audit signing key is missing at {key_path}. Signed history exists in {table}; "
+                "restore the original key from backup before starting. No replacement was created."
+            )
+
+
+def _audit_integrity_tag(table: str, row: Dict[str, Any], *, key: Optional[bytes] = None) -> str:
     safe_table = _safe_sql_identifier(str(table or ""), "")
     if safe_table not in AUDIT_INTEGRITY_TABLES:
         return ""
@@ -7962,6 +8016,8 @@ def _audit_integrity_tag(table: str, row: Dict[str, Any]) -> str:
         "fields": {field: json_safe(row.get(field), max_str=20000) for field in field_order},
     }
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    if key is not None:
+        return hmac.new(key, canonical.encode("utf-8", errors="surrogatepass"), hashlib.sha256).hexdigest()
     return _server_hmac_tag("audit_row_integrity_hmac_key", canonical, 64)
 
 
@@ -7972,9 +8028,32 @@ def _audit_integrity_status(table: str, row: Dict[str, Any]) -> Dict[str, Any]:
         return {"signed": False, "verified": None, "status": "legacy_unsigned", "algorithm": alg}
     if alg and alg != AUDIT_INTEGRITY_ALGORITHM:
         return {"signed": True, "verified": False, "status": "unknown_algorithm", "algorithm": alg}
-    expected = _audit_integrity_tag(table, {field: _row_get(row, field) for field in AUDIT_INTEGRITY_FIELDS.get(table, ())})
-    verified = bool(expected and secrets.compare_digest(stored, expected))
-    return {"signed": True, "verified": verified, "status": "verified" if verified else "mismatch", "algorithm": alg or AUDIT_INTEGRITY_ALGORITHM}
+    fields = {field: _row_get(row, field) for field in AUDIT_INTEGRITY_FIELDS.get(table, ())}
+    expected = _audit_integrity_tag(table, fields)
+    if expected and secrets.compare_digest(stored, expected):
+        return {"signed": True, "verified": True, "status": "verified", "algorithm": alg or AUDIT_INTEGRITY_ALGORITHM}
+    variants = [fields]
+    if table == "visitor_access_log" and fields.get("device_memory_gb") is not None:
+        # MySQL DECIMAL(8,2) returns Decimal even if the original browser value
+        # was a JSON number. Preserve verifiable old signatures without rewriting them.
+        try:
+            numeric = Decimal(str(fields["device_memory_gb"]))
+            if numeric.is_finite():
+                for original in (float(numeric), int(numeric) if numeric == int(numeric) else None):
+                    if original is not None:
+                        variant = dict(fields)
+                        variant["device_memory_gb"] = original
+                        variants.append(variant)
+        except (InvalidOperation, ValueError, OverflowError):
+            pass
+    keys = _audit_previous_hmac_keys()
+    for index, variant in enumerate(variants):
+        if index and secrets.compare_digest(stored, _audit_integrity_tag(table, variant)):
+            return {"signed": True, "verified": True, "status": "verified", "algorithm": alg or AUDIT_INTEGRITY_ALGORITHM, "legacy_numeric": True}
+        for old_key in keys:
+            if secrets.compare_digest(stored, _audit_integrity_tag(table, variant, key=old_key)):
+                return {"signed": True, "verified": True, "status": "verified", "algorithm": alg or AUDIT_INTEGRITY_ALGORITHM, "previous_key": True, "legacy_numeric": bool(index)}
+    return {"signed": True, "verified": False, "status": "mismatch", "algorithm": alg or AUDIT_INTEGRITY_ALGORITHM}
 
 
 def _db_insert_row_with_integrity(conn: Any, table: str, row: Dict[str, Any]) -> Any:
@@ -7984,6 +8063,14 @@ def _db_insert_row_with_integrity(conn: Any, table: str, row: Dict[str, Any]) ->
     cols = db_table_columns(conn, table)
     insert_row = {str(k): v for k, v in row.items() if str(k) in cols}
     insert_row = _audit_protect_row(table, insert_row)
+    if table == "visitor_access_log" and insert_row.get("device_memory_gb") is not None:
+        # Sign the exact DECIMAL(8,2) shape MySQL will return after the insert.
+        try:
+            value = Decimal(str(insert_row["device_memory_gb"]))
+            if value.is_finite():
+                insert_row["device_memory_gb"] = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError, OverflowError):
+            pass  # Leave invalid input to the database; never sign a guessed value.
     if "integrity_tag" in cols and "integrity_alg" in cols and table in AUDIT_INTEGRITY_TABLES:
         insert_row["integrity_alg"] = AUDIT_INTEGRITY_ALGORITHM
         insert_row["integrity_tag"] = _audit_integrity_tag(table, insert_row)
@@ -8014,22 +8101,32 @@ def _audit_integrity_summary(conn: Any, limit: int = 200) -> Dict[str, Any]:
                 conn,
                 f"SELECT {', '.join(_db_ident(field) for field in select_fields)} FROM {_db_ident(table)} ORDER BY {_db_ident('id')} DESC LIMIT {limit}",
             )
-            counts = {"sampled": len(rows), "verified": 0, "mismatch": 0, "legacy_unsigned": 0, "unknown_algorithm": 0}
+            counts = {"sampled": len(rows), "verified": 0, "verified_previous_key": 0, "verified_legacy_numeric": 0, "mismatch": 0, "legacy_unsigned": 0, "unknown_algorithm": 0}
+            date_ranges: Dict[str, Dict[str, str]] = {}
             for row in rows:
                 status = _audit_integrity_status(table, row)
                 state = str(status.get("status") or "legacy_unsigned")
                 if state == "verified":
                     counts["verified"] += 1
+                    counts["verified_previous_key"] += int(bool(status.get("previous_key")))
+                    counts["verified_legacy_numeric"] += int(bool(status.get("legacy_numeric")))
                 elif state == "mismatch":
                     counts["mismatch"] += 1
                 elif state == "unknown_algorithm":
                     counts["unknown_algorithm"] += 1
                 else:
                     counts["legacy_unsigned"] += 1
+                when = str(_row_get(row, "event_at" if table == "visitor_access_log" else "created_at", "") or "")
+                if when:
+                    date_state = ("verified_previous_key" if status.get("previous_key") else "verified_current_key") if state == "verified" else state
+                    dates = date_ranges.setdefault(date_state, {"oldest": when, "newest": when})
+                    dates["oldest"] = min(dates["oldest"], when)
+                    dates["newest"] = max(dates["newest"], when)
             summary["tables"][table] = {
                 "ok": True,
                 "columns_present": has_integrity,
                 **counts,
+                "date_ranges": date_ranges,
             }
         except Exception as exc:
             summary["tables"][table] = {"ok": False, "error": _redact_database_error(exc)}
@@ -8338,6 +8435,7 @@ def _init_mysql_db() -> None:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         _ensure_audit_integrity_columns(conn)
+        _audit_assert_signing_key_not_lost(conn)
         conn.commit()
 
 
@@ -29018,10 +29116,15 @@ def sub_dominator_scan(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     return {"ok": True, "crawl_results": report}
 
-WEBSITE_COPIER_DOWNLOAD_TTL_SECONDS = max(120, int(os.environ.get("LL_WEB_WEBSITE_COPIER_DOWNLOAD_TTL", "180" if C8_LOW_MEMORY_MODE else "900") or ("180" if C8_LOW_MEMORY_MODE else "900")))
+WEBSITE_COPIER_DOWNLOAD_TTL_SECONDS = max(120, int(os.environ.get("LL_WEB_WEBSITE_COPIER_DOWNLOAD_TTL", "600" if C8_LOW_MEMORY_MODE else "900") or ("600" if C8_LOW_MEMORY_MODE else "900")))
 WEBSITE_COPIER_DOWNLOAD_MAX_ITEMS = max(1, min(32, int(os.environ.get("LL_WEB_WEBSITE_COPIER_DOWNLOAD_MAX_ITEMS", "2" if C8_LOW_MEMORY_MODE else "12") or ("2" if C8_LOW_MEMORY_MODE else "12"))))
 _WEBSITE_COPIER_DOWNLOAD_LOCK = threading.RLock()
 _WEBSITE_COPIER_DOWNLOADS: Dict[str, Dict[str, Any]] = {}
+WEBSITE_COPIER_JOB_TTL_SECONDS = 900
+WEBSITE_COPIER_MAX_JOBS = 4 if C8_LOW_MEMORY_MODE else 12
+WEBSITE_COPIER_ACTIVE_JOB_LIMIT = 1 if C8_LOW_MEMORY_MODE else 2
+_WEBSITE_COPIER_JOB_LOCK = threading.RLock()
+_WEBSITE_COPIER_JOBS: Dict[str, Dict[str, Any]] = {}
 
 
 def _website_copier_session_key(session: Dict[str, Any]) -> str:
@@ -29094,7 +29197,127 @@ def _website_copier_get_download(session: Dict[str, Any], download_token: str) -
     return archive, filename, sha256_value
 
 
-def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _website_copier_cleanup_jobs(now: Optional[float] = None) -> None:
+    current = float(now if now is not None else time.time())
+    for job_id, job in list(_WEBSITE_COPIER_JOBS.items()):
+        if job.get("state") in {"done", "failed"} and current >= float(job.get("expires_at") or 0):
+            _WEBSITE_COPIER_JOBS.pop(job_id, None)
+    if len(_WEBSITE_COPIER_JOBS) > WEBSITE_COPIER_MAX_JOBS:
+        finished = sorted(
+            ((job_id, job) for job_id, job in _WEBSITE_COPIER_JOBS.items() if job.get("state") in {"done", "failed"}),
+            key=lambda item: float(item[1].get("finished_at") or 0),
+        )
+        for job_id, _job in finished[:len(_WEBSITE_COPIER_JOBS) - WEBSITE_COPIER_MAX_JOBS]:
+            _WEBSITE_COPIER_JOBS.pop(job_id, None)
+
+
+def _website_copier_job_status(session: Dict[str, Any], job_id: Any) -> Dict[str, Any]:
+    clean_id = str(job_id or "").strip()
+    if not clean_id or len(clean_id) > 120:
+        raise FileNotFoundError("Website Copier job ID is invalid.")
+    owner = _website_copier_session_key(session)
+    with _WEBSITE_COPIER_JOB_LOCK:
+        _website_copier_cleanup_jobs()
+        job = _WEBSITE_COPIER_JOBS.get(clean_id)
+        if not job:
+            raise FileNotFoundError("Website Copier job expired or was lost when the server restarted. Start a new copy.")
+        if not hmac.compare_digest(str(job.get("session_key") or ""), owner):
+            raise PermissionError("This Website Copier job belongs to another authenticated session.")
+        response = {
+            "ok": True,
+            "job_id": clean_id,
+            "state": job["state"],
+            "progress": dict(job.get("progress") or {}),
+        }
+        if job["state"] == "done":
+            response["result"] = dict(job.get("result") or {})
+        elif job["state"] == "failed":
+            response["error"] = str(job.get("error") or "Website Copier could not complete this archive.")
+        return response
+
+
+def _website_copier_job_worker(job_id: str, session_token: str, payload: Dict[str, Any]) -> None:
+    def progress(stage: str, pages: int, assets: int, requests: int, message: str) -> None:
+        with _WEBSITE_COPIER_JOB_LOCK:
+            job = _WEBSITE_COPIER_JOBS.get(job_id)
+            if job:
+                job["progress"] = {
+                    "stage": str(stage)[:40], "pages_saved": int(pages),
+                    "assets_saved": int(assets), "requests_used": int(requests),
+                    "message": str(message)[:400],
+                }
+
+    try:
+        with _WEBSITE_COPIER_JOB_LOCK:
+            _WEBSITE_COPIER_JOBS[job_id]["state"] = "running"
+        with _c8_bounded_network_operation("Website Copier"):
+            report = website_copier_copy(payload, progress=progress)
+            archive = report.pop("archive_bytes", b"")
+            if not isinstance(archive, (bytes, bytearray, memoryview)) or not archive:
+                raise RuntimeError("Website Copier did not produce a ZIP payload.")
+            download_token = _website_copier_store_download({"token": session_token}, archive, str(report.get("archive_name") or "website_copy.zip"))
+            report["download_url"] = "/api/website-copier/download?token=" + urllib.parse.quote(download_token, safe="")
+            report["download_expires_seconds"] = WEBSITE_COPIER_DOWNLOAD_TTL_SECONDS
+            report["download_ready"] = True
+        with _WEBSITE_COPIER_JOB_LOCK:
+            job = _WEBSITE_COPIER_JOBS.get(job_id)
+            if job:
+                job.update(state="done", result=report, finished_at=time.time(), expires_at=time.time() + WEBSITE_COPIER_DOWNLOAD_TTL_SECONDS)
+    except Exception as exc:
+        if isinstance(exc, (ValueError, RuntimeError, C8SecurityInputError)):
+            message = _c8_security_log_text(exc)[:900]
+        else:
+            message = "Website Copier failed. Check the server log for the error type."
+        print(f"Website Copier job {job_id[:12]} failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+        with _WEBSITE_COPIER_JOB_LOCK:
+            job = _WEBSITE_COPIER_JOBS.get(job_id)
+            if job:
+                job.update(state="failed", error=message, finished_at=time.time(), expires_at=time.time() + WEBSITE_COPIER_JOB_TTL_SECONDS)
+    finally:
+        _c8_trim_memory()
+
+
+def _website_copier_start_job(session: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    if payload.get("authorized") is not True:
+        raise ValueError("Confirm that you own or are authorized to copy this site.")
+    target = str(payload.get("target") or "").strip()
+    if not target or len(target) > 2048:
+        raise ValueError("Enter an authorized public site URL of at most 2048 characters.")
+    parts = urllib.parse.urlsplit(target if "://" in target else "https://" + target)
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+        raise ValueError("Enter an http:// or https:// URL without embedded credentials.")
+    owner = _website_copier_session_key(session)
+    now = time.time()
+    with _WEBSITE_COPIER_JOB_LOCK:
+        _website_copier_cleanup_jobs(now)
+        active = [job for job in _WEBSITE_COPIER_JOBS.values() if job["state"] in {"queued", "running"}]
+        for job in active:
+            if hmac.compare_digest(str(job["session_key"]), owner):
+                if str(job.get("target") or "") != target:
+                    raise RuntimeError("Your previous Website Copier job is still running for another site. Wait for it to finish before starting a new target.")
+                return {"ok": True, "job_id": job["id"], "state": job["state"], "poll_seconds": 2.5, "resumed": True}
+        if len(active) >= WEBSITE_COPIER_ACTIVE_JOB_LIMIT:
+            raise RuntimeError("Another Website Copier job is running. Try again after it completes.")
+        job_id = secrets.token_urlsafe(24)
+        _WEBSITE_COPIER_JOBS[job_id] = {
+            "id": job_id, "session_key": owner, "target": target, "state": "queued", "created_at": now,
+            "expires_at": 0, "progress": {"stage": "queued", "pages_saved": 0, "assets_saved": 0, "requests_used": 0},
+        }
+    try:
+        thread = threading.Thread(
+            target=_website_copier_job_worker,
+            args=(job_id, str(session.get("token") or ""), dict(payload)),
+            daemon=True, name="c8-website-copier",
+        )
+        thread.start()
+    except Exception:
+        with _WEBSITE_COPIER_JOB_LOCK:
+            _WEBSITE_COPIER_JOBS.pop(job_id, None)
+        raise
+    return {"ok": True, "job_id": job_id, "state": "queued", "poll_seconds": 2.5}
+
+
+def website_copier_copy(payload: Dict[str, Any], progress: Optional[Any] = None) -> Dict[str, Any]:
     """Create a bounded same-site ZIP archive without external helper scripts.
 
     The copier is intentionally conservative: authorization must be confirmed,
@@ -29118,12 +29341,13 @@ def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not target_had_explicit_scheme:
         target = "https://" + target
 
-    max_depth = max(0, min(3, int(payload.get("max_depth") or 2)))
+    max_depth = max(0, min(3, int(payload.get("max_depth", 2))))
     copier_page_cap = 8 if C8_ULTRA_LOW_MEMORY_MODE else (14 if C8_LOW_MEMORY_MODE else 40)
     max_pages = max(1, min(copier_page_cap, int(payload.get("max_pages") or min(20, copier_page_cap))))
     delay = max(0.5, min(5.0, float(payload.get("delay") or 1.0)))
     request_timeout = max(3, min(15, int(payload.get("timeout") or 10)))
     include_subdomains = bool(payload.get("include_subdomains"))
+    max_runtime_seconds = 360 if C8_ULTRA_LOW_MEMORY_MODE else (600 if C8_LOW_MEMORY_MODE else 900)
 
     if C8_ULTRA_LOW_MEMORY_MODE:
         max_assets = 48
@@ -29483,6 +29707,24 @@ def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
     page_final_seen: set = set()
     implicit_scheme_fallback_queued = False
 
+    def _emit_progress(stage: str, message: str) -> None:
+        if callable(progress):
+            try:
+                progress(stage, len(page_records), len(asset_records), requests_used, message)
+            except Exception:
+                pass
+
+    _emit_progress("starting", "Checking site permissions and robots.txt.")
+
+    def _should_stop() -> bool:
+        if time.time() - started >= max_runtime_seconds:
+            _log(f"Stopped at the {max_runtime_seconds}-second server time budget; saving pages and assets collected so far.")
+            return True
+        if _c8_memory_pressure(0.82 if C8_ULTRA_LOW_MEMORY_MODE else 0.88):
+            _log("Stopped early due to server memory pressure; saving pages and assets collected so far.")
+            return True
+        return False
+
     def _queue_implicit_scheme_fallback(failed_url: str, reason: str) -> None:
         nonlocal implicit_scheme_fallback_queued
         if target_had_explicit_scheme or implicit_scheme_fallback_queued or page_records:
@@ -29499,6 +29741,8 @@ def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
         _log(f"Initial HTTPS attempt was unusable ({reason}); trying HTTP on the same authorized host.")
 
     while page_queue and len(page_records) < max_pages:
+        if _should_stop():
+            break
         page_url, depth = page_queue.pop(0)
         page_url = _canonical(page_url)
         if not page_url or page_url in page_seen:
@@ -29553,6 +29797,7 @@ def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
             "css_chunks": list(collector.css_chunks[:256]),
         })
         _log(f"Saved page {len(page_records)}/{max_pages}: {final_url}")
+        _emit_progress("pages", f"Saved page {len(page_records)}/{max_pages}.")
 
         if depth < max_depth:
             for ref in collector.pages:
@@ -29617,6 +29862,8 @@ def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     asset_index = 0
     while asset_index < len(asset_candidates) and len(asset_records) < max_assets and requests_used < max_requests:
+        if _should_stop():
+            break
         asset_url = asset_candidates[asset_index]
         asset_index += 1
         if not _robots_allowed(asset_url):
@@ -29636,6 +29883,7 @@ def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         path = _archive_path(final_url, False, content_type)
         asset_records.append({"url": final_url, "content_type": content_type, "data": data, "path": path})
+        _emit_progress("assets", f"Saved asset {len(asset_records)}/{max_assets}.")
         if content_type == "text/css" or str(final_url).lower().split("?", 1)[0].endswith(".css"):
             try:
                 css_text = data.decode("utf-8", errors="replace")
@@ -29735,6 +29983,7 @@ def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
         rewritten = _rewrite_css(rewritten, page_url, page_path)
         return rewritten
 
+    _emit_progress("archive", "Packaging collected pages and assets into a ZIP.")
     buffer = BytesIO()
     manifest: List[Dict[str, Any]] = []
 
@@ -29816,6 +30065,7 @@ def website_copier_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
             "max_asset_bytes": max_asset_bytes,
             "max_total_download_bytes": max_total_download_bytes,
             "max_archive_bytes": max_archive_bytes,
+            "max_runtime_seconds": max_runtime_seconds,
             "standard_web_ports_only": True,
             "public_networks_only": True,
         },
@@ -32387,6 +32637,11 @@ body.theme-dark .black-cloud-member.active{background:#10233a;border-color:#4c6f
   .black-cloud-message{max-width:88%;}
 }
 
+    /* Visible site-wide restriction; print previews contain no console data. */
+    .c8-no-screenshots{position:fixed;z-index:10000;right:10px;bottom:10px;padding:6px 10px;border:2px solid #fff;background:#8a1f1f;color:#fff;box-shadow:0 4px 18px #0006;font:800 .74rem/1.25 Arial,sans-serif;letter-spacing:.03em;pointer-events:none}
+    .c8-privacy-controls{display:grid;gap:10px}.c8-privacy-controls label{display:flex;align-items:flex-start;gap:10px;cursor:pointer;line-height:1.4}.c8-privacy-controls input[type="checkbox"]{width:18px;height:18px;flex:none;margin:1px 0}.c8-privacy-controls p{margin:0;color:var(--muted)}
+    .c8-privacy-value{display:inline-block;max-width:100%;vertical-align:baseline;white-space:pre-wrap;overflow-wrap:anywhere}.c8-privacy-blur .c8-privacy-value:not(:hover):not(:focus):not([data-c8-revealed="true"]){filter:blur(7px);user-select:none;-webkit-user-select:none;cursor:pointer}.c8-privacy-blur .c8-privacy-field:not(:hover):not(:focus){filter:blur(7px)}
+    @media print{body > *{display:none!important}body::before{content:"SENSITIVE — Printing this console is disabled.";display:block!important;padding:24px;font:18pt Arial,sans-serif;color:#000;background:#fff}}
 </style>
   <link rel="stylesheet" href="/assets/dome/leaflet.css?v=c8-dome-2" />
   <link rel="stylesheet" href="/assets/dome/leaflet.draw.css?v=c8-dome-2" />
@@ -32396,6 +32651,7 @@ body.theme-dark .black-cloud-member.active{background:#10233a;border-color:#4c6f
 <body class="theme-light">
   <div class="us-site-banner" role="note" aria-label="Site location notice"><div class="us-site-banner-inner"><img class="us-site-banner-flag" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA3NDEgMzkwIiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlVuaXRlZCBTdGF0ZXMgZmxhZyI+PHJlY3QgeD0iMCIgeT0iMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjMwIiB3aWR0aD0iNzQxIiBoZWlnaHQ9IjMwIiBmaWxsPSIjRkZGRkZGIi8+PHJlY3QgeD0iMCIgeT0iNjAiIHdpZHRoPSI3NDEiIGhlaWdodD0iMzAiIGZpbGw9IiNCMzE5NDIiLz48cmVjdCB4PSIwIiB5PSI5MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjEyMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjE1MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjE4MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjIxMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjI0MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjI3MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjMwMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjMzMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjM2MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjAiIHdpZHRoPSIyOTYuNCIgaGVpZ2h0PSIyMTAiIGZpbGw9IiMwQTMxNjEiLz48cG9seWdvbiBwb2ludHM9IjI0LjcwLDExLjAwIDI2LjM1LDE1LjczIDMxLjM2LDE1Ljg0IDI3LjM2LDE4Ljg3IDI4LjgxLDIzLjY2IDI0LjcwLDIwLjgwIDIwLjU5LDIzLjY2IDIyLjA0LDE4Ljg3IDE4LjA0LDE1Ljg0IDIzLjA1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxMS4wMCA3NS43NSwxNS43MyA4MC43NiwxNS44NCA3Ni43NiwxOC44NyA3OC4yMSwyMy42NiA3NC4xMCwyMC44MCA2OS45OSwyMy42NiA3MS40NCwxOC44NyA2Ny40NCwxNS44NCA3Mi40NSwxNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTIzLjUwLDExLjAwIDEyNS4xNSwxNS43MyAxMzAuMTYsMTUuODQgMTI2LjE2LDE4Ljg3IDEyNy42MSwyMy42NiAxMjMuNTAsMjAuODAgMTE5LjM5LDIzLjY2IDEyMC44NCwxOC44NyAxMTYuODQsMTUuODQgMTIxLjg1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxNzIuOTAsMTEuMDAgMTc0LjU1LDE1LjczIDE3OS41NiwxNS44NCAxNzUuNTYsMTguODcgMTc3LjAxLDIzLjY2IDE3Mi45MCwyMC44MCAxNjguNzksMjMuNjYgMTcwLjI0LDE4Ljg3IDE2Ni4yNCwxNS44NCAxNzEuMjUsMTUuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxMS4wMCAyMjMuOTUsMTUuNzMgMjI4Ljk2LDE1Ljg0IDIyNC45NiwxOC44NyAyMjYuNDEsMjMuNjYgMjIyLjMwLDIwLjgwIDIxOC4xOSwyMy42NiAyMTkuNjQsMTguODcgMjE1LjY0LDE1Ljg0IDIyMC42NSwxNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjcxLjcwLDExLjAwIDI3My4zNSwxNS43MyAyNzguMzYsMTUuODQgMjc0LjM2LDE4Ljg3IDI3NS44MSwyMy42NiAyNzEuNzAsMjAuODAgMjY3LjU5LDIzLjY2IDI2OS4wNCwxOC44NyAyNjUuMDQsMTUuODQgMjcwLjA1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI0OS40MCwzMy4wMCA1MS4wNSwzNy43MyA1Ni4wNiwzNy44NCA1Mi4wNiw0MC44NyA1My41MSw0NS42NiA0OS40MCw0Mi44MCA0NS4yOSw0NS42NiA0Ni43NCw0MC44NyA0Mi43NCwzNy44NCA0Ny43NSwzNy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMzMuMDAgMTAwLjQ1LDM3LjczIDEwNS40NiwzNy44NCAxMDEuNDYsNDAuODcgMTAyLjkxLDQ1LjY2IDk4LjgwLDQyLjgwIDk0LjY5LDQ1LjY2IDk2LjE0LDQwLjg3IDkyLjE0LDM3Ljg0IDk3LjE1LDM3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxNDguMjAsMzMuMDAgMTQ5Ljg1LDM3LjczIDE1NC44NiwzNy44NCAxNTAuODYsNDAuODcgMTUyLjMxLDQ1LjY2IDE0OC4yMCw0Mi44MCAxNDQuMDksNDUuNjYgMTQ1LjU0LDQwLjg3IDE0MS41NCwzNy44NCAxNDYuNTUsMzcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE5Ny42MCwzMy4wMCAxOTkuMjUsMzcuNzMgMjA0LjI2LDM3Ljg0IDIwMC4yNiw0MC44NyAyMDEuNzEsNDUuNjYgMTk3LjYwLDQyLjgwIDE5My40OSw0NS42NiAxOTQuOTQsNDAuODcgMTkwLjk0LDM3Ljg0IDE5NS45NSwzNy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDMzLjAwIDI0OC42NSwzNy43MyAyNTMuNjYsMzcuODQgMjQ5LjY2LDQwLjg3IDI1MS4xMSw0NS42NiAyNDcuMDAsNDIuODAgMjQyLjg5LDQ1LjY2IDI0NC4zNCw0MC44NyAyNDAuMzQsMzcuODQgMjQ1LjM1LDM3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyNC43MCw1NS4wMCAyNi4zNSw1OS43MyAzMS4zNiw1OS44NCAyNy4zNiw2Mi44NyAyOC44MSw2Ny42NiAyNC43MCw2NC44MCAyMC41OSw2Ny42NiAyMi4wNCw2Mi44NyAxOC4wNCw1OS44NCAyMy4wNSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iNzQuMTAsNTUuMDAgNzUuNzUsNTkuNzMgODAuNzYsNTkuODQgNzYuNzYsNjIuODcgNzguMjEsNjcuNjYgNzQuMTAsNjQuODAgNjkuOTksNjcuNjYgNzEuNDQsNjIuODcgNjcuNDQsNTkuODQgNzIuNDUsNTkuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCw1NS4wMCAxMjUuMTUsNTkuNzMgMTMwLjE2LDU5Ljg0IDEyNi4xNiw2Mi44NyAxMjcuNjEsNjcuNjYgMTIzLjUwLDY0LjgwIDExOS4zOSw2Ny42NiAxMjAuODQsNjIuODcgMTE2Ljg0LDU5Ljg0IDEyMS44NSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTcyLjkwLDU1LjAwIDE3NC41NSw1OS43MyAxNzkuNTYsNTkuODQgMTc1LjU2LDYyLjg3IDE3Ny4wMSw2Ny42NiAxNzIuOTAsNjQuODAgMTY4Ljc5LDY3LjY2IDE3MC4yNCw2Mi44NyAxNjYuMjQsNTkuODQgMTcxLjI1LDU5LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyMjIuMzAsNTUuMDAgMjIzLjk1LDU5LjczIDIyOC45Niw1OS44NCAyMjQuOTYsNjIuODcgMjI2LjQxLDY3LjY2IDIyMi4zMCw2NC44MCAyMTguMTksNjcuNjYgMjE5LjY0LDYyLjg3IDIxNS42NCw1OS44NCAyMjAuNjUsNTkuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCw1NS4wMCAyNzMuMzUsNTkuNzMgMjc4LjM2LDU5Ljg0IDI3NC4zNiw2Mi44NyAyNzUuODEsNjcuNjYgMjcxLjcwLDY0LjgwIDI2Ny41OSw2Ny42NiAyNjkuMDQsNjIuODcgMjY1LjA0LDU5Ljg0IDI3MC4wNSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iNDkuNDAsNzcuMDAgNTEuMDUsODEuNzMgNTYuMDYsODEuODQgNTIuMDYsODQuODcgNTMuNTEsODkuNjYgNDkuNDAsODYuODAgNDUuMjksODkuNjYgNDYuNzQsODQuODcgNDIuNzQsODEuODQgNDcuNzUsODEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9Ijk4LjgwLDc3LjAwIDEwMC40NSw4MS43MyAxMDUuNDYsODEuODQgMTAxLjQ2LDg0Ljg3IDEwMi45MSw4OS42NiA5OC44MCw4Ni44MCA5NC42OSw4OS42NiA5Ni4xNCw4NC44NyA5Mi4xNCw4MS44NCA5Ny4xNSw4MS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDc3LjAwIDE0OS44NSw4MS43MyAxNTQuODYsODEuODQgMTUwLjg2LDg0Ljg3IDE1Mi4zMSw4OS42NiAxNDguMjAsODYuODAgMTQ0LjA5LDg5LjY2IDE0NS41NCw4NC44NyAxNDEuNTQsODEuODQgMTQ2LjU1LDgxLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxOTcuNjAsNzcuMDAgMTk5LjI1LDgxLjczIDIwNC4yNiw4MS44NCAyMDAuMjYsODQuODcgMjAxLjcxLDg5LjY2IDE5Ny42MCw4Ni44MCAxOTMuNDksODkuNjYgMTk0Ljk0LDg0Ljg3IDE5MC45NCw4MS44NCAxOTUuOTUsODEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI0Ny4wMCw3Ny4wMCAyNDguNjUsODEuNzMgMjUzLjY2LDgxLjg0IDI0OS42Niw4NC44NyAyNTEuMTEsODkuNjYgMjQ3LjAwLDg2LjgwIDI0Mi44OSw4OS42NiAyNDQuMzQsODQuODcgMjQwLjM0LDgxLjg0IDI0NS4zNSw4MS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsOTkuMDAgMjYuMzUsMTAzLjczIDMxLjM2LDEwMy44NCAyNy4zNiwxMDYuODcgMjguODEsMTExLjY2IDI0LjcwLDEwOC44MCAyMC41OSwxMTEuNjYgMjIuMDQsMTA2Ljg3IDE4LjA0LDEwMy44NCAyMy4wNSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9Ijc0LjEwLDk5LjAwIDc1Ljc1LDEwMy43MyA4MC43NiwxMDMuODQgNzYuNzYsMTA2Ljg3IDc4LjIxLDExMS42NiA3NC4xMCwxMDguODAgNjkuOTksMTExLjY2IDcxLjQ0LDEwNi44NyA2Ny40NCwxMDMuODQgNzIuNDUsMTAzLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxMjMuNTAsOTkuMDAgMTI1LjE1LDEwMy43MyAxMzAuMTYsMTAzLjg0IDEyNi4xNiwxMDYuODcgMTI3LjYxLDExMS42NiAxMjMuNTAsMTA4LjgwIDExOS4zOSwxMTEuNjYgMTIwLjg0LDEwNi44NyAxMTYuODQsMTAzLjg0IDEyMS44NSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCw5OS4wMCAxNzQuNTUsMTAzLjczIDE3OS41NiwxMDMuODQgMTc1LjU2LDEwNi44NyAxNzcuMDEsMTExLjY2IDE3Mi45MCwxMDguODAgMTY4Ljc5LDExMS42NiAxNzAuMjQsMTA2Ljg3IDE2Ni4yNCwxMDMuODQgMTcxLjI1LDEwMy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjIyLjMwLDk5LjAwIDIyMy45NSwxMDMuNzMgMjI4Ljk2LDEwMy44NCAyMjQuOTYsMTA2Ljg3IDIyNi40MSwxMTEuNjYgMjIyLjMwLDEwOC44MCAyMTguMTksMTExLjY2IDIxOS42NCwxMDYuODcgMjE1LjY0LDEwMy44NCAyMjAuNjUsMTAzLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyNzEuNzAsOTkuMDAgMjczLjM1LDEwMy43MyAyNzguMzYsMTAzLjg0IDI3NC4zNiwxMDYuODcgMjc1LjgxLDExMS42NiAyNzEuNzAsMTA4LjgwIDI2Ny41OSwxMTEuNjYgMjY5LjA0LDEwNi44NyAyNjUuMDQsMTAzLjg0IDI3MC4wNSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjQ5LjQwLDEyMS4wMCA1MS4wNSwxMjUuNzMgNTYuMDYsMTI1Ljg0IDUyLjA2LDEyOC44NyA1My41MSwxMzMuNjYgNDkuNDAsMTMwLjgwIDQ1LjI5LDEzMy42NiA0Ni43NCwxMjguODcgNDIuNzQsMTI1Ljg0IDQ3Ljc1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMTIxLjAwIDEwMC40NSwxMjUuNzMgMTA1LjQ2LDEyNS44NCAxMDEuNDYsMTI4Ljg3IDEwMi45MSwxMzMuNjYgOTguODAsMTMwLjgwIDk0LjY5LDEzMy42NiA5Ni4xNCwxMjguODcgOTIuMTQsMTI1Ljg0IDk3LjE1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDEyMS4wMCAxNDkuODUsMTI1LjczIDE1NC44NiwxMjUuODQgMTUwLjg2LDEyOC44NyAxNTIuMzEsMTMzLjY2IDE0OC4yMCwxMzAuODAgMTQ0LjA5LDEzMy42NiAxNDUuNTQsMTI4Ljg3IDE0MS41NCwxMjUuODQgMTQ2LjU1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTk3LjYwLDEyMS4wMCAxOTkuMjUsMTI1LjczIDIwNC4yNiwxMjUuODQgMjAwLjI2LDEyOC44NyAyMDEuNzEsMTMzLjY2IDE5Ny42MCwxMzAuODAgMTkzLjQ5LDEzMy42NiAxOTQuOTQsMTI4Ljg3IDE5MC45NCwxMjUuODQgMTk1Ljk1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDEyMS4wMCAyNDguNjUsMTI1LjczIDI1My42NiwxMjUuODQgMjQ5LjY2LDEyOC44NyAyNTEuMTEsMTMzLjY2IDI0Ny4wMCwxMzAuODAgMjQyLjg5LDEzMy42NiAyNDQuMzQsMTI4Ljg3IDI0MC4zNCwxMjUuODQgMjQ1LjM1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsMTQzLjAwIDI2LjM1LDE0Ny43MyAzMS4zNiwxNDcuODQgMjcuMzYsMTUwLjg3IDI4LjgxLDE1NS42NiAyNC43MCwxNTIuODAgMjAuNTksMTU1LjY2IDIyLjA0LDE1MC44NyAxOC4wNCwxNDcuODQgMjMuMDUsMTQ3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxNDMuMDAgNzUuNzUsMTQ3LjczIDgwLjc2LDE0Ny44NCA3Ni43NiwxNTAuODcgNzguMjEsMTU1LjY2IDc0LjEwLDE1Mi44MCA2OS45OSwxNTUuNjYgNzEuNDQsMTUwLjg3IDY3LjQ0LDE0Ny44NCA3Mi40NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCwxNDMuMDAgMTI1LjE1LDE0Ny43MyAxMzAuMTYsMTQ3Ljg0IDEyNi4xNiwxNTAuODcgMTI3LjYxLDE1NS42NiAxMjMuNTAsMTUyLjgwIDExOS4zOSwxNTUuNjYgMTIwLjg0LDE1MC44NyAxMTYuODQsMTQ3Ljg0IDEyMS44NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCwxNDMuMDAgMTc0LjU1LDE0Ny43MyAxNzkuNTYsMTQ3Ljg0IDE3NS41NiwxNTAuODcgMTc3LjAxLDE1NS42NiAxNzIuOTAsMTUyLjgwIDE2OC43OSwxNTUuNjYgMTcwLjI0LDE1MC44NyAxNjYuMjQsMTQ3Ljg0IDE3MS4yNSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxNDMuMDAgMjIzLjk1LDE0Ny43MyAyMjguOTYsMTQ3Ljg0IDIyNC45NiwxNTAuODcgMjI2LjQxLDE1NS42NiAyMjIuMzAsMTUyLjgwIDIxOC4xOSwxNTUuNjYgMjE5LjY0LDE1MC44NyAyMTUuNjQsMTQ3Ljg0IDIyMC42NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCwxNDMuMDAgMjczLjM1LDE0Ny43MyAyNzguMzYsMTQ3Ljg0IDI3NC4zNiwxNTAuODcgMjc1LjgxLDE1NS42NiAyNzEuNzAsMTUyLjgwIDI2Ny41OSwxNTUuNjYgMjY5LjA0LDE1MC44NyAyNjUuMDQsMTQ3Ljg0IDI3MC4wNSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjQ5LjQwLDE2NS4wMCA1MS4wNSwxNjkuNzMgNTYuMDYsMTY5Ljg0IDUyLjA2LDE3Mi44NyA1My41MSwxNzcuNjYgNDkuNDAsMTc0LjgwIDQ1LjI5LDE3Ny42NiA0Ni43NCwxNzIuODcgNDIuNzQsMTY5Ljg0IDQ3Ljc1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMTY1LjAwIDEwMC40NSwxNjkuNzMgMTA1LjQ2LDE2OS44NCAxMDEuNDYsMTcyLjg3IDEwMi45MSwxNzcuNjYgOTguODAsMTc0LjgwIDk0LjY5LDE3Ny42NiA5Ni4xNCwxNzIuODcgOTIuMTQsMTY5Ljg0IDk3LjE1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDE2NS4wMCAxNDkuODUsMTY5LjczIDE1NC44NiwxNjkuODQgMTUwLjg2LDE3Mi44NyAxNTIuMzEsMTc3LjY2IDE0OC4yMCwxNzQuODAgMTQ0LjA5LDE3Ny42NiAxNDUuNTQsMTcyLjg3IDE0MS41NCwxNjkuODQgMTQ2LjU1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTk3LjYwLDE2NS4wMCAxOTkuMjUsMTY5LjczIDIwNC4yNiwxNjkuODQgMjAwLjI2LDE3Mi44NyAyMDEuNzEsMTc3LjY2IDE5Ny42MCwxNzQuODAgMTkzLjQ5LDE3Ny42NiAxOTQuOTQsMTcyLjg3IDE5MC45NCwxNjkuODQgMTk1Ljk1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDE2NS4wMCAyNDguNjUsMTY5LjczIDI1My42NiwxNjkuODQgMjQ5LjY2LDE3Mi44NyAyNTEuMTEsMTc3LjY2IDI0Ny4wMCwxNzQuODAgMjQyLjg5LDE3Ny42NiAyNDQuMzQsMTcyLjg3IDI0MC4zNCwxNjkuODQgMjQ1LjM1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsMTg3LjAwIDI2LjM1LDE5MS43MyAzMS4zNiwxOTEuODQgMjcuMzYsMTk0Ljg3IDI4LjgxLDE5OS42NiAyNC43MCwxOTYuODAgMjAuNTksMTk5LjY2IDIyLjA0LDE5NC44NyAxOC4wNCwxOTEuODQgMjMuMDUsMTkxLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxODcuMDAgNzUuNzUsMTkxLjczIDgwLjc2LDE5MS44NCA3Ni43NiwxOTQuODcgNzguMjEsMTk5LjY2IDc0LjEwLDE5Ni44MCA2OS45OSwxOTkuNjYgNzEuNDQsMTk0Ljg3IDY3LjQ0LDE5MS44NCA3Mi40NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCwxODcuMDAgMTI1LjE1LDE5MS43MyAxMzAuMTYsMTkxLjg0IDEyNi4xNiwxOTQuODcgMTI3LjYxLDE5OS42NiAxMjMuNTAsMTk2LjgwIDExOS4zOSwxOTkuNjYgMTIwLjg0LDE5NC44NyAxMTYuODQsMTkxLjg0IDEyMS44NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCwxODcuMDAgMTc0LjU1LDE5MS43MyAxNzkuNTYsMTkxLjg0IDE3NS41NiwxOTQuODcgMTc3LjAxLDE5OS42NiAxNzIuOTAsMTk2LjgwIDE2OC43OSwxOTkuNjYgMTcwLjI0LDE5NC44NyAxNjYuMjQsMTkxLjg0IDE3MS4yNSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxODcuMDAgMjIzLjk1LDE5MS43MyAyMjguOTYsMTkxLjg0IDIyNC45NiwxOTQuODcgMjI2LjQxLDE5OS42NiAyMjIuMzAsMTk2LjgwIDIxOC4xOSwxOTkuNjYgMjE5LjY0LDE5NC44NyAyMTUuNjQsMTkxLjg0IDIyMC42NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCwxODcuMDAgMjczLjM1LDE5MS43MyAyNzguMzYsMTkxLjg0IDI3NC4zNiwxOTQuODcgMjc1LjgxLDE5OS42NiAyNzEuNzAsMTk2LjgwIDI2Ny41OSwxOTkuNjYgMjY5LjA0LDE5NC44NyAyNjUuMDQsMTkxLjg0IDI3MC4wNSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48L3N2Zz4=" alt="United States flag"><button id="us-site-banner-how-toggle" class="us-site-banner-how-toggle" type="button" aria-expanded="false" aria-controls="us-site-banner-how" onclick="toggleOfficialSiteHow()"><span class="us-site-banner-how-label">Here's how you know</span> <span class="us-site-banner-chevron" aria-hidden="true">⌄</span></button><span class="us-site-banner-text">An official website of the United States</span></div><div id="us-site-banner-how" class="us-site-banner-how" aria-hidden="true"><div class="us-site-banner-how-inner"><div class="us-site-banner-lock" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M17 9h-1V7a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9h14v-9a2 2 0 0 0-2-2Zm-7-2a2 2 0 1 1 4 0v2h-4V7Zm3 8.73V18h-2v-2.27a2 2 0 1 1 2 0Z"/></svg></div><div class="us-site-banner-how-copy"><strong>Secure C-8 websites use HTTPS</strong><p>A lock (<span aria-label="lock">🔒</span>) or <span class="https-emphasis">https://</span> means you've safely connected to the C-8 website. Share sensitive information only on official, secure websites.</p></div></div></div></div>
   <div class="topbar"></div>
+  <div class="c8-no-screenshots" role="note">SENSITIVE · NO SCREENSHOTS</div>
   <section id="loading" class="loading-screen hidden"><div class="loading-card"><div class="seal"><img src="/c8-brand-logo-v1.png?v=c8-brand-v1" alt="C-8 Federal logo"></div><h1>Integrated Operations Console</h1><p>Initializing secure console services.</p><div class="progress-track"><div class="progress-bar"></div></div><div class="small-caps">Controlled Unclassified Environment</div></div></section>
   <section id="app" class="app-shell"><header><div class="header-inner"><div class="brand"><div class="mini-seal"><img src="/c8-brand-logo-v1.png?v=c8-brand-v1" alt="C-8 Federal logo"></div><div><div class="agency">C-8 Federal</div><div class="subagency">Integrated Operations Console</div></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><a class="version-pill" href="/shop/" style="text-decoration:none;font-weight:800">Shop</a><a class="version-pill" href="mailto:C8-Console-Support@proton.me" style="text-decoration:none;font-weight:800">Support</a><div class="version-pill" id="clock">UTC</div></div></div></header><main class="dashboard"><nav class="side-panel"><div class="side-title"><span>Console Menu</span></div><div id="nav"></div><div class="footer-note">Bound to <span class="kbd">__BIND_LABEL__</span>. Tools run only after database login unless explicitly configured otherwise.</div></nav><section class="dashboard-panel"><div class="panel-heading"><h2 id="module-title">Overview</h2><div class="muted" id="module-subtitle">Ready</div></div><div class="panel-body" id="content"></div></section></main></section>
 <footer class="site-footer" aria-label="Site information"><span class="site-footer-ip">104.248.233.71</span><span class="site-footer-agency">An official website of the U.S. C-8 Administration</span></footer>
@@ -32412,7 +32668,7 @@ const C8_TRUSTED_TYPES_POLICY = (()=>{
   }
 })();
 const MODULES = ["Overview","IP Forensics","Connectivity Assessment","IP Database","OSINT","Email Forensics","File Forensics","Sub-Dominator","Website Copier","Site Forensics","ICMP Probe","Profiler","Shredder","Meta View/Wipe","Stegano","De/Encrypter","Black Cloud","Dome","Settings"];
-const state = { current: "Overview", theme: "dark", csrf: null, authenticated: false, role: "operator", isAdmin: false, username: "", userId: null };
+const state = { current: "Overview", theme: "dark", csrf: null, authenticated: false, role: "operator", isAdmin: false, username: "", userId: null, privacyBlur: false };
 const C8_BOOTSTRAP_SESSION = __C8_BOOTSTRAP_SESSION__;
 function $(id){ return document.getElementById(id); }
 function toggleOfficialSiteHow(forceOpen){
@@ -32532,7 +32788,136 @@ function applyTheme(theme){
   const select = $('theme-select'); if(select) select.value = t;
 }
 function setTheme(theme){ applyTheme(theme); auditClientEvent('theme_change',{theme:String(theme||'')}); }
-function settingsSync(){ applyTheme(state.theme || savedTheme()); }
+// Admin display privacy. Mask titles so hovering does not bypass blur.
+const c8PrivacyTitles=new Map();
+const c8PrivacyLabel=/\b(?:ip|cidr|user(?:name)?|account|email|e-mail|name|notes?|reason|viewer|owner|created by|updated by|edited by|subject|identity|alias|host|operator)\b/i;
+const c8PrivacyLiteral=/(?:\b(?:\d{1,3}\.){3}\d{1,3}(?:\/\d{1,2})?\b|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|\b(?:[a-f\d]{1,4}:){7}[a-f\d]{1,4}\b|(?:^|[^\da-f:])(?:[a-f\d]{0,4}:){1,7}:[a-f\d]{0,4}(?![\da-f:]))/i;
+let c8PrivacyObserver=null;
+function c8PrivacyEnabled(){return state.authenticated&&state.isAdmin&&state.privacyBlur;}
+function c8PrivacyTitleScan(root){
+  const elements=root.matches&&root.matches('[title]')?[root]:[];
+  if(root.querySelectorAll)elements.push(...root.querySelectorAll('[title]'));
+  for(const el of elements){
+    const title=el.getAttribute('title');
+    if(title&&c8PrivacyLiteral.test(title)&&!c8PrivacyTitles.has(el)){
+      c8PrivacyTitles.set(el,title);
+      el.removeAttribute('title');
+    }
+  }
+}
+function c8PrivacySensitiveText(node){
+  const el=node.parentElement;
+  if(!el||!node.nodeValue||!node.nodeValue.trim()||el.closest('script,style,noscript,.c8-privacy-value,.c8-privacy-controls,.c8-no-screenshots'))return false;
+  const value=node.nodeValue;
+  if(c8PrivacyLiteral.test(value))return true;
+  if(el.closest('.ipdb-username,.ipdb-subline,.admin-user-title,.online-user-name'))return true;
+  if(el.closest('.ipdb-notes')&&!el.matches('.ipdb-notes > span'))return true;
+  if(el.closest('pre')&&['Users','Live','Visitors','Security','Activity Logs','Opt-Out Requests','IP Database'].includes(state.current))return true;
+  const field=el.closest('.ipdb-field,.admin-user-field,.online-user-meta > div,.online-session-row > div');
+  if(field){
+    const label=field.querySelector('span,code');
+    if(label&&!label.contains(el)&&c8PrivacyLabel.test(label.textContent))return true;
+  }
+  const cell=el.closest('td');
+  if(cell){
+    const table=cell.closest('table');
+    const heading=table&&table.tHead&&table.tHead.rows[0]&&table.tHead.rows[0].cells[cell.cellIndex];
+    if(heading&&c8PrivacyLabel.test(heading.textContent))return true;
+  }
+  return false;
+}
+function c8PrivacyField(field){
+  if(!field||!field.matches||!field.matches('input,textarea,select'))return;
+  const type=String(field.type||'').toLowerCase();
+  if(['password','hidden','file','checkbox','radio','submit','button'].includes(type))return;
+  const label=field.closest('.field')?.querySelector('label')?.textContent||'';
+  const hint=[field.id,field.name,field.placeholder,label].join(' ');
+  if(c8PrivacyLabel.test(hint)||c8PrivacyLiteral.test(field.value||''))field.classList.add('c8-privacy-field');
+}
+function c8PrivacyScan(root){
+  if(!c8PrivacyEnabled()||!root)return;
+  const el=root.nodeType===1?root:root.parentElement;
+  if(!el||el.closest('.c8-privacy-value,.c8-no-screenshots,.c8-privacy-controls'))return;
+  c8PrivacyTitleScan(el);
+  if(el.matches&&el.matches('input,textarea,select'))c8PrivacyField(el);
+  if(el.querySelectorAll)el.querySelectorAll('input,textarea,select').forEach(c8PrivacyField);
+  const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT);
+  const matches=[];
+  while(walker.nextNode()){
+    const node=walker.currentNode;
+    if(c8PrivacySensitiveText(node))matches.push(node);
+  }
+  for(const node of matches){
+    if(!node.parentNode||node.parentElement.closest('.c8-privacy-value'))continue;
+    const span=document.createElement('span');
+    span.className='c8-privacy-value';
+    span.tabIndex=0;
+    node.parentNode.replaceChild(span,node);
+    span.appendChild(node);
+  }
+}
+function c8PrivacyWatch(){
+  if(c8PrivacyObserver)return;
+  c8PrivacyObserver=new MutationObserver(changes=>{
+    if(!c8PrivacyEnabled())return;
+    for(const change of changes){
+      const target=change.target.nodeType===1?change.target:change.target.parentElement;
+      if(!target||!target.closest('#content,.site-footer-ip,#ipdb-redaction-dialog'))continue;
+      for(const node of change.addedNodes){
+        if(node.nodeType===1||node.nodeType===3)c8PrivacyScan(node);
+      }
+    }
+  });
+  c8PrivacyObserver.observe(document.body,{subtree:true,childList:true});
+}
+function c8PrivacyApply(){
+  const enabled=c8PrivacyEnabled();
+  document.body.classList.toggle('c8-privacy-blur',enabled);
+  if(enabled){
+    c8PrivacyWatch();
+    c8PrivacyScan($('content'));
+    c8PrivacyScan(document.querySelector('.site-footer-ip'));
+  }else{
+    for(const [el,title] of c8PrivacyTitles)if(el.isConnected)el.setAttribute('title',title);
+    c8PrivacyTitles.clear();
+    document.querySelectorAll('.c8-privacy-value').forEach(el=>el.removeAttribute('data-c8-revealed'));
+  }
+  const blur=$('c8-privacy-blur-toggle');
+  if(blur)blur.checked=enabled;
+}
+function c8PrivacyLoad(){
+  try{
+    state.privacyBlur=window.sessionStorage.getItem('c8-admin-privacy-blur')==='1';
+  }catch(_e){state.privacyBlur=false;}
+  c8PrivacyApply();
+}
+function c8PrivacyClear(){
+  try{window.sessionStorage.removeItem('c8-admin-privacy-blur');}catch(_e){}
+}
+function setPrivacyMode(mode,enabled){
+  if(!state.authenticated||!state.isAdmin||mode!=='blur')return;
+  state.privacyBlur=!!enabled;
+  try{
+    window.sessionStorage.setItem('c8-admin-privacy-blur',state.privacyBlur?'1':'0');
+  }catch(_e){}
+  c8PrivacyApply();
+}
+document.addEventListener('click',event=>{
+  if(!c8PrivacyEnabled()||!event.target.closest)return;
+  const el=event.target.closest('.c8-privacy-value');
+  if(!el)return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  el.setAttribute('data-c8-revealed',el.getAttribute('data-c8-revealed')==='true'?'false':'true');
+},true);
+document.addEventListener('input',event=>{if(c8PrivacyEnabled())c8PrivacyField(event.target);},true);
+document.addEventListener('change',event=>{if(c8PrivacyEnabled())c8PrivacyField(event.target);},true);
+function settingsSync(){
+  applyTheme(state.theme || savedTheme());
+  c8PrivacyApply();
+  const blur=$('c8-privacy-blur-toggle');
+  if(blur)blur.addEventListener('change',()=>setPrivacyMode('blur',blur.checked));
+}
 function setResult(id, data){ $(id).textContent = typeof data === 'string' ? data : pretty(data); }
 async function api(path, payload, options={}){
   const headers = {'Content-Type':'application/json'};
@@ -32934,6 +33319,8 @@ function handleVisitorKick(kick){
   state.username='';
   state.userId=null;
   try{ $('app').classList.add('hidden'); }catch(_e){}
+  c8PrivacyClear();
+  c8PrivacyApply();
   try{ $('loading').classList.add('hidden'); }catch(_e){}
   try{ $('login').classList.remove('hidden'); }catch(_e){}
   const err=$('login-error');
@@ -33128,6 +33515,7 @@ function c8BootFromServerSession(){
   return true;
 }
 async function logoutSession(){
+  c8PrivacyClear();
   try{ await api('/api/session/logout', {}); }catch(e){}
   try{ window.location.replace('/'); }catch(e){ window.location.href='/'; }
 }
@@ -33963,7 +34351,7 @@ function domeBeep(){ try{const C=window.AudioContext||window.webkitAudioContext;
 function domeToast(message,kind=''){ const stack=$('dome-toast-stack');if(!stack)return;const el=document.createElement('div');el.className=`dome-toast ${kind||''}`;el.textContent=message;stack.appendChild(el);setTimeout(()=>el.remove(),6500); }
 function domeAppendLog(message){ const el=$('dome-alert-log');if(!el)return;const line=`[${new Date().toISOString()}] ${message}`;el.textContent=(el.textContent==='Dome initialized.'?'':el.textContent+'\n')+line;el.scrollTop=el.scrollHeight; }
 
-RENDER["Settings"] = () => `<div class="module-note">Console display settings. Pick the theme card you want to use. The choice is saved in browser storage and applied immediately.</div><div class="card"><div class="tool-header"><div><div class="tool-title">Console Settings</div><div class="muted">Theme and display preferences.</div></div><span class="badge-soft">Current: <span id="theme-current">LIGHT</span></span></div><div class="theme-toggle-grid"><div class="theme-card" data-theme-card="dark" onclick="setTheme('dark')"><strong>Dark Theme</strong><span>Dark console chrome, dark tables, dark navigation, and subdued agency-style panels.</span></div><div class="theme-card" data-theme-card="light" onclick="setTheme('light')"><strong>Light Theme</strong><span>Light console chrome, white panels, high-readability forms, and brighter navigation.</span></div></div></div>`;
+RENDER["Settings"] = () => `<div class="module-note">Console display settings. Theme changes apply immediately. Administrators can also enable Privacy Blur for sensitive values.</div><div class="card"><div class="tool-header"><div><div class="tool-title">Console Settings</div><div class="muted">Theme and administrator privacy preferences.</div></div><span class="badge-soft">Current: <span id="theme-current">LIGHT</span></span></div><div class="theme-toggle-grid"><div class="theme-card" data-theme-card="dark" onclick="setTheme('dark')"><strong>Dark Theme</strong><span>Dark console chrome, dark tables, dark navigation, and subdued agency-style panels.</span></div><div class="theme-card" data-theme-card="light" onclick="setTheme('light')"><strong>Light Theme</strong><span>Light console chrome, white panels, high-readability forms, and brighter navigation.</span></div></div></div>${state.isAdmin?`<div class="card c8-privacy-controls" data-admin-only="true"><h3>Privacy Blur Mode</h3><label><input id="c8-privacy-blur-toggle" type="checkbox"><span>Blur IP addresses, usernames, email addresses, and notes until hovered, focused, or clicked.</span></label><p>The no-screenshots notice and blocked print view apply to every user.</p></div>`:''}`;
 function ipfValue(v){
   if(v===null || v===undefined || v==='') return 'N/A';
   if(Array.isArray(v)) return v.length ? v.map(x=>esc(typeof x==='object'?JSON.stringify(x):x)).join('<br>') : 'N/A';
@@ -35040,6 +35428,8 @@ let websiteCopierArchiveB64 = '';
 let websiteCopierArchiveName = '';
 let websiteCopierDownloadUrl = '';
 let websiteCopierLastReport = null;
+let websiteCopierJobId = '';
+let websiteCopierRunEpoch = 0;
 RENDER["Website Copier"] = () => `<div class="module-note">Create a local ZIP archive of public, same-site pages and assets from a website you own or are authorized to copy. The server validates every destination and redirect, honors robots.txt when available, blocks non-public networks, and applies fixed request and download budgets.</div><div class="card adaptive-tool site-workflow-tool"><div class="tool-header"><div><div class="tool-title">Website Copier</div><div class="muted">Reliable same-site HTML, CSS, image, font, and asset archive</div></div><span class="badge-soft">ZIP download</span></div><div class="field"><label>Authorized public site</label><input id="website-copy-target" type="url" placeholder="https://example.com" onkeydown="if(event.key==='Enter'){event.preventDefault();websiteCopierRun()}"></div><div class="form-grid-3"><div class="field"><label>Maximum pages</label><select id="website-copy-pages"><option value="5">5</option><option value="10">10</option><option value="20" selected>20</option><option value="40">40</option></select></div><div class="field"><label>Link depth</label><select id="website-copy-depth"><option value="0">Start page only</option><option value="1">1 level</option><option value="2" selected>2 levels</option><option value="3">3 levels</option></select></div><div class="field"><label>Request delay</label><select id="website-copy-delay"><option value="0.5">0.5 seconds</option><option value="1" selected>1 second</option><option value="2">2 seconds</option><option value="3">3 seconds</option></select></div></div><div class="form-grid"><div class="field"><label>Request timeout</label><select id="website-copy-timeout"><option value="5">5 seconds</option><option value="10" selected>10 seconds</option><option value="15">15 seconds</option></select></div><div class="field"><label>Host scope</label><label class="site-choice"><input type="checkbox" id="website-copy-subdomains"><span>Include public subdomains</span></label></div></div><label class="site-consent"><input type="checkbox" id="website-copy-authorized"><span>I confirm that I own this site or have permission to copy and archive it.</span></label><div class="actions site-actions"><button id="website-copy-run" class="primary-btn" onclick="websiteCopierRun()">Create Archive</button><button id="website-copy-download" class="secondary-btn" onclick="websiteCopierDownload()" disabled>Download ZIP</button><span id="website-copy-download-status" class="muted"></span><button class="secondary-btn" onclick="websiteCopierClear()">Clear</button></div></div><div id="website-copy-summary" class="status-row site-summary"></div><div class="card site-output-card"><div class="site-output-head"><h3>Archive Contents</h3><span class="badge-soft">ZIP Manifest</span></div><div id="website-copy-files" class="site-output-body">No website archive has been created.</div></div><details class="card site-log-card"><summary>Archive log</summary><pre id="website-copy-log" class="result">No run log.</pre></details>`;
 
 function websiteCopierBytes(value){
@@ -35061,6 +35451,7 @@ function websiteCopierBlobFromBase64(base64Value){
 }
 async function websiteCopierRun(){
   const runButton=$('website-copy-run');
+  const runEpoch=++websiteCopierRunEpoch;
   try{
     const target=String(($('website-copy-target')||{}).value||'').trim();
     if(!target) throw new Error('Enter the authorized public site URL.');
@@ -35069,11 +35460,12 @@ async function websiteCopierRun(){
     websiteCopierArchiveName='';
     websiteCopierDownloadUrl='';
     websiteCopierLastReport=null;
+    websiteCopierJobId='';
     if($('website-copy-download')) $('website-copy-download').disabled=true;
     if(runButton){runButton.disabled=true;runButton.textContent='Creating...';}
     if($('website-copy-files')) $('website-copy-files').innerHTML='<div class="module-note">Creating the bounded archive. The configured request delay and page count can make this take several minutes.</div>';
     if($('website-copy-log')) $('website-copy-log').textContent='Starting authorized website copy...';
-    const data=await api('/api/website-copier',{
+    const start=await api('/api/website-copier',{
       target,
       authorized:true,
       max_pages:Number(($('website-copy-pages')||{}).value||20),
@@ -35081,7 +35473,37 @@ async function websiteCopierRun(){
       delay:Number(($('website-copy-delay')||{}).value||1),
       timeout:Number(($('website-copy-timeout')||{}).value||10),
       include_subdomains:!!($('website-copy-subdomains')&&$('website-copy-subdomains').checked)
-    });
+    },{timeoutMs:20000,attempts:2,retryDelayMs:800});
+    websiteCopierJobId=String(start.job_id||'');
+    if(!websiteCopierJobId)throw new Error('The server did not provide a Website Copier job ID.');
+    let data=null;
+    let pollErrors=0;
+    while(runEpoch===websiteCopierRunEpoch){
+      let status;
+      try{
+        status=await api('/api/website-copier/status',{job_id:websiteCopierJobId},{timeoutMs:12000,attempts:2,retryDelayMs:800});
+        pollErrors=0;
+      }catch(error){
+        if(/job expired or was lost|job id is invalid|belongs to another authenticated session|session locked|sign in again/i.test(String(error.message||'')))throw error;
+        if(++pollErrors>=4)throw new Error(`Could not reach the server for progress. The job may still be running; press Create Archive to reconnect. ${error.message||error}`);
+        if($('website-copy-log'))$('website-copy-log').textContent=`Waiting for the server to reconnect (attempt ${pollErrors}/4)...`;
+        await new Promise(resolve=>setTimeout(resolve,3000));
+        continue;
+      }
+      if(runEpoch!==websiteCopierRunEpoch)return;
+      if(status.state==='done'){
+        data=status.result||{};
+        break;
+      }
+      if(status.state==='failed')throw new Error(status.error||'Website Copier could not complete this archive.');
+      const info=status.progress||{};
+      const message=String(info.message||(status.state==='queued'?'Waiting for the copier worker.':'Crawling authorized pages and assets.'));
+      if($('website-copy-files'))$('website-copy-files').innerHTML=`<div class="module-note">${esc(message)} Pages: ${esc(String(info.pages_saved||0))}; assets: ${esc(String(info.assets_saved||0))}; requests: ${esc(String(info.requests_used||0))}.</div>`;
+      if($('website-copy-log'))$('website-copy-log').textContent=`Job ${status.state||'running'}: ${message}`;
+      await new Promise(resolve=>setTimeout(resolve,2500));
+    }
+    if(runEpoch!==websiteCopierRunEpoch)return;
+    if(!data)throw new Error('Website Copier did not return a completed report.');
     websiteCopierArchiveB64=String(data.archive_b64||'');
     websiteCopierArchiveName=String(data.archive_name||'website_copy.zip');
     websiteCopierDownloadUrl=String(data.download_url||'');
@@ -35095,6 +35517,7 @@ async function websiteCopierRun(){
     if($('website-copy-files')) $('website-copy-files').innerHTML=files.length?`<table><thead><tr><th>Archived file</th><th>Size</th></tr></thead><tbody>${files.map(file=>`<tr><td>${esc(file.path||'')}</td><td>${esc(websiteCopierBytes(file.size_bytes))}</td></tr>`).join('')}</tbody></table>`:'<div class="module-note">The crawl completed without archived files.</div>';
     if($('website-copy-log')) $('website-copy-log').textContent=String(data.log||'Archive completed.');
   }catch(e){
+    if(runEpoch!==websiteCopierRunEpoch)return;
     websiteCopierArchiveB64='';
     websiteCopierArchiveName='';
     websiteCopierDownloadUrl='';
@@ -35104,7 +35527,7 @@ async function websiteCopierRun(){
     if($('website-copy-files')) $('website-copy-files').innerHTML=`<div class="module-note bad">ERROR: ${esc(e.message||String(e))}</div>`;
     if($('website-copy-log')) $('website-copy-log').textContent='ERROR: '+(e.message||String(e));
   }finally{
-    if(runButton){runButton.disabled=false;runButton.textContent='Create Archive';}
+    if(runEpoch===websiteCopierRunEpoch&&runButton){runButton.disabled=false;runButton.textContent='Create Archive';}
   }
 }
 async function websiteCopierDownload(){
@@ -35145,6 +35568,9 @@ async function websiteCopierDownload(){
   }
 }
 function websiteCopierClear(){
+  websiteCopierRunEpoch++;
+  websiteCopierJobId='';
+  if($('website-copy-run')){$('website-copy-run').disabled=false;$('website-copy-run').textContent='Create Archive';}
   websiteCopierArchiveB64='';
   websiteCopierArchiveName='';
   websiteCopierDownloadUrl='';
@@ -37229,11 +37655,26 @@ function securitySignalSummary(event){
   const extra=secSignals.length>4?securityChip(`+${secSignals.length-4} more`,securityTone(secSignals.join(' '))):'';
   return `<div class="security-signal-list">${signals.join('')}${extra}</div>`;
 }
+function adminSecurityGuardIP(guard){
+  if(String(guard?.kind||'').toLowerCase()!=='ip')return '';
+  const ip=String(guard?.subject||'').trim();
+  if(!/^[0-9a-f:.]+$/i.test(ip))return '';
+  if(ip.includes(':')){
+    try{return new URL(`http://[${ip}]/`).hostname?ip:'';}catch{return '';}
+  }
+  const octets=ip.split('.');
+  return octets.length===4&&octets.every(v=>/^(0|[1-9]\d{0,2})$/.test(v)&&Number(v)<=255)?ip:'';
+}
+function adminSecurityVisibleGuardIPs(){
+  const q=String(($('admin-security-search')||{}).value||'').trim().toLowerCase();
+  return [...new Set((adminSecurityCache.guards||[]).filter(g=>!q||pretty(g).toLowerCase().includes(q)).map(adminSecurityGuardIP).filter(Boolean))];
+}
 function adminSecurityPaint(){
   const root=$('admin-security-result');if(!root)return;
   const q=String(($('admin-security-search')||{}).value||'').trim().toLowerCase();
   const events=(adminSecurityCache.events||[]).filter(e=>!q||pretty(e).toLowerCase().includes(q));
   const guards=(adminSecurityCache.guards||[]).filter(g=>!q||pretty(g).toLowerCase().includes(q));
+  const guardIPs=[...new Set(guards.map(adminSecurityGuardIP).filter(Boolean))];
   const floodGuards=[...(adminSecurityCache.request_guards||[]),...(adminSecurityCache.network_guards||[])].filter(g=>!q||pretty(g).toLowerCase().includes(q));
   const bans=(adminSecurityCache.persistent_ip_bans||[]).filter(b=>!q||pretty(b).toLowerCase().includes(q));
   const ipFirewall=adminSecurityCache.persistent_ip_firewall||{};
@@ -37254,23 +37695,39 @@ function adminSecurityPaint(){
   const guardRows=guards.length?guards.map(g=>{
     const active=Number(g.retry_after_seconds||0)>0;
     const tone=active?'critical':(Number(g.failure_count||0)>0?'medium':'ok');
-    return `<tr><td>${securityChip(g.kind||'guard',tone)}</td><td>${securityCode(g.subject||'N/A','subject')}</td><td>${securityCount(g.failure_count??0,5,1)}</td><td>${securityCount(g.distinct_count??0,3,1)}</td><td>${active?securityChip(`${g.retry_after_seconds} sec`,'critical'):securityChip('Not blocked','ok')}</td><td><span class="security-reason">${esc(g.reason||'N/A')}</span></td><td>${esc(g.updated_at||'')}</td></tr>`;
-  }).join(''):'<tr><td colspan="7">No active login guards.</td></tr>';
+    const ip=adminSecurityGuardIP(g);
+    return `<tr><td>${securityChip(g.kind||'guard',tone)}</td><td>${securityCode(g.subject||'N/A','subject')}</td><td>${securityCount(g.failure_count??0,5,1)}</td><td>${securityCount(g.distinct_count??0,3,1)}</td><td>${active?securityChip(`${g.retry_after_seconds} sec`,'critical'):securityChip('Not blocked','ok')}</td><td><span class="security-reason">${esc(g.reason||'N/A')}</span></td><td>${esc(g.updated_at||'')}</td><td>${ip?`<button class="secondary-btn" type="button" data-ip="${esc(ip)}" onclick="adminSecurityBanGuardIP(this.dataset.ip)">Ban IP</button>`:'—'}</td></tr>`;
+  }).join(''):'<tr><td colspan="8">No login guards match.</td></tr>';
   const integrityTables=((adminSecurityCache.audit_integrity||{}).tables)||{};
-  const integrityRows=Object.keys(integrityTables).length?Object.entries(integrityTables).map(([name,row])=>{const mismatch=Number(row.mismatch||0)+Number(row.unknown_algorithm||0);const legacy=Number(row.legacy_unsigned||0);const status=row.columns_present?(mismatch?securityChip('Mismatch','critical'):(legacy?securityChip('Mixed','medium'):securityChip('Verified','ok'))):securityChip('No columns','medium');return `<tr><td>${securityCode(name,'subject')}</td><td>${status}</td><td>${esc(row.verified??0)}</td><td>${securityCount(row.mismatch??0,1,1)}</td><td>${legacy?securityChip(String(legacy),'medium'):esc(0)}</td><td>${esc(row.sampled??0)}</td></tr>`;}).join(''):'<tr><td colspan="6">No integrity sample available.</td></tr>';
-  root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th><th>Action</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p><p class="tiny ${ipFirewall.active&&ipFirewall.ok?'ok':'bad'}">${ipFirewallMessage}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Mismatch</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
+  const integrityMismatch=Object.values(integrityTables).reduce((n,row)=>n+Number(row.mismatch||0)+Number(row.unknown_algorithm||0),0);
+  const integrityNote=integrityMismatch?`<p class="tiny bad">${integrityMismatch} sampled records cannot be verified. Check the original audit signing key and run --audit-integrity-check on the VPS. No mismatched records have been re-signed.</p>`:'';
+  const integrityRows=Object.keys(integrityTables).length?Object.entries(integrityTables).map(([name,row])=>{const mismatch=Number(row.mismatch||0)+Number(row.unknown_algorithm||0);const legacy=Number(row.legacy_unsigned||0);const status=row.columns_present?(mismatch?securityChip('Mismatch','critical'):(legacy?securityChip('Mixed','medium'):securityChip('Verified','ok'))):securityChip('No columns','medium');return `<tr><td>${securityCode(name,'subject')}</td><td>${status}</td><td>${esc(row.verified??0)}</td><td>${esc(row.verified_previous_key??0)}</td><td>${esc(row.verified_legacy_numeric??0)}</td><td>${securityCount(row.mismatch??0,1,1)}</td><td>${legacy?securityChip(String(legacy),'medium'):esc(0)}</td><td>${esc(row.sampled??0)}</td></tr>`;}).join(''):'<tr><td colspan="8">No integrity sample available.</td></tr>';
+  root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><p class="tiny muted">Ban only IP subjects. Account and combined guards do not contain an IP address.</p><div class="actions" style="margin:0 0 12px"><button class="secondary-btn" type="button" onclick="adminSecurityBanGuardIPs()" ${guardIPs.length?'':'disabled'}>Ban ${guardIPs.length} displayed guard IP${guardIPs.length===1?'':'s'}</button></div><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th><th>Action</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th><th>Action</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p><p class="tiny ${ipFirewall.active&&ipFirewall.ok?'ok':'bad'}">${ipFirewallMessage}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3>${integrityNote}<div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Prior key</th><th>Legacy numeric</th><th>Mismatch</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
 }
 let adminBanRequestBusy=false;
+async function adminSecurityBanGuardIP(ip){
+  const clean=adminSecurityGuardIP({kind:'ip',subject:ip});
+  if(!clean){adminBanFeedback('This guard does not contain a valid IP address.',true);return;}
+  if(!confirm(`Ban ${clean} using the selected reason and duration?`))return;
+  await adminSecurityBan(false,clean);
+}
+async function adminSecurityBanGuardIPs(){
+  const ips=adminSecurityVisibleGuardIPs();
+  if(!ips.length){adminBanFeedback('There are no IP guards in the current search results.',true);return;}
+  if(ips.length>256){adminBanFeedback('The ban limit is 256 IPs per submission. Narrow the search to select fewer IP guards.',true);return;}
+  await adminSecurityBan(true,ips.join('\n'));
+}
 function adminBanFeedback(message,failed=false){
   const el=$('admin-ban-feedback');if(!el)return;
   el.textContent=String(message||'');
   el.className=failed?'tiny bad':'tiny ok';
 }
-async function adminSecurityBan(bulk=false){
+async function adminSecurityBan(bulk=false,overrideSubjects=null){
   if(!state.isAdmin){showLogin('Admin role required.');return;}
   if(adminBanRequestBusy)return;
   const input=$(bulk?'admin-ban-bulk':'admin-ban-single');
-  const subjects=String(input?.value||'').trim();
+  const fromGuards=overrideSubjects!==null;
+  const subjects=String(fromGuards?overrideSubjects:(input?.value||'')).trim();
   if(!subjects){adminBanFeedback('Enter an IP address or CIDR network.',true);return;}
   const candidateCount=subjects.split(/[\s,;]+/).filter(Boolean).length;
   if(bulk&&!confirm(`Ban ${candidateCount} supplied IPs/networks? Every entry must be valid.`))return;
@@ -37280,7 +37737,7 @@ async function adminSecurityBan(bulk=false){
   adminBanFeedback('Saving bans and syncing the VPS firewall...');
   try{
     const data=await api('/api/admin/ip-bans/add',{subjects,reason,duration_seconds},{timeoutMs:180000});
-    if(input)input.value='';
+    if(input&&!fromGuards)input.value='';
     await adminSecurityLoad(true);
     const fw=data.firewall||{};
     if(fw.ok&&fw.active){
@@ -37475,6 +37932,7 @@ function showModule(name){
   const fn = RENDER[name] || RENDER['Overview'];
   $('content').innerHTML = fn();
   applyAdminOnlyUi();
+  c8PrivacyApply();
   if(name==='Connectivity Assessment'){ connectivityLoad(); }
   if(name==='IP Database'){ ipdbLoad(); }
   if(name==='ICMP Probe'){ icmpProfileChanged(); icmpRenderTable(); }
@@ -37504,11 +37962,14 @@ function showLogin(message){
   state.isAdmin = false;
   state.username = '';
   state.userId = null;
+  c8PrivacyClear();
+  c8PrivacyApply();
   try{ window.location.replace('/'); }catch(e){ window.location.href='/'; }
 }
 function showApp(){
   c8BootComplete = true;
   state.authenticated = true;
+  c8PrivacyLoad();
   const loading=$('loading'); if(loading) loading.classList.add('hidden');
   const login=$('login'); if(login) login.classList.add('hidden');
   const app=$('app'); if(app) app.classList.remove('hidden');
@@ -38608,7 +39069,7 @@ def _print_startup_diagnostics() -> None:
         f"{'enabled' if black_cloud_configuration['proxy_enabled'] else 'disabled'}.",
         flush=True,
     )
-    print("- Tools: --security-check, --tls-cert PATH --tls-key PATH, --mysql-ca PATH, --digitalocean-database-id UUID, --auth-diagnose [username], --create-user USERNAME [--admin], --remove-user USERNAME, --online-users, --ban-ip IP [--reason TEXT] [--ban-seconds N], --unban-ip IP, --list-banned-ips, --sync-firewall-bans, --restore-operator-bans, --privacy-purge-ip IP, --ipdb-count, --ipdb-import [path].", flush=True)
+    print("- Tools: --security-check, --audit-integrity-check, --tls-cert PATH --tls-key PATH, --mysql-ca PATH, --digitalocean-database-id UUID, --auth-diagnose [username], --create-user USERNAME [--admin], --remove-user USERNAME, --online-users, --ban-ip IP [--reason TEXT] [--ban-seconds N], --unban-ip IP, --list-banned-ips, --sync-firewall-bans, --restore-operator-bans, --privacy-purge-ip IP, --ipdb-count, --ipdb-import [path].", flush=True)
     print("- Deny env: LL_WEB_DENY_CLIENT_CIDRS, LL_WEB_BLOCK_USER_AGENTS, LL_WEB_GOV_DENY_CIDRS, LL_WEB_BLOCK_GOV_NETWORKS=1, LL_WEB_GOV_RDAP_LOOKUP=1.", flush=True)
     print("- Keep this process running. If it stops, browsers get ERR_CONNECTION_REFUSED.", flush=True)
     print("=" * 72, flush=True)
@@ -42959,7 +43420,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/activity/client-event":
                 payload = _sanitize_client_event_payload(payload)
-            if path not in {"/api/online-users", "/api/admin/online-users", "/api/icmp/job", "/api/dome/snapshot", "/api/permission-review"} and not path.startswith("/api/black-cloud/chat/") and not path.startswith("/api/black-cloud/photo/"):
+            if path not in {"/api/online-users", "/api/admin/online-users", "/api/icmp/job", "/api/dome/snapshot", "/api/permission-review", "/api/website-copier/status"} and not path.startswith("/api/black-cloud/chat/") and not path.startswith("/api/black-cloud/photo/"):
                 activity_payload = dict(payload)
                 activity_payload["_request"] = self._request_metadata()
                 record_user_activity(
@@ -43298,18 +43759,14 @@ class Handler(BaseHTTPRequestHandler):
                 with _c8_heavy_operation("Stegano"):
                     self._json(200, stegano_web_action(session, payload))
             elif path == "/api/website-copier":
-                with _c8_bounded_network_operation("Website Copier"):
-                    website_report = website_copier_copy(payload)
-                    archive_bytes = website_report.pop("archive_bytes", b"")
-                    if not isinstance(archive_bytes, (bytes, bytearray, memoryview)) or not archive_bytes:
-                        raise RuntimeError("Website Copier did not produce a ZIP payload.")
-                    download_token = _website_copier_store_download(session, archive_bytes, str(website_report.get("archive_name") or "website_copy.zip"))
-                    del archive_bytes
-                    website_report["download_url"] = "/api/website-copier/download?token=" + urllib.parse.quote(download_token, safe="")
-                    website_report["download_expires_seconds"] = WEBSITE_COPIER_DOWNLOAD_TTL_SECONDS
-                    website_report["download_ready"] = True
-                    self._json(200, website_report)
-                    del website_report
+                self._json(202, _website_copier_start_job(session, payload))
+            elif path == "/api/website-copier/status":
+                try:
+                    self._json(200, _website_copier_job_status(session, payload.get("job_id")))
+                except FileNotFoundError as exc:
+                    self._json(404, {"ok": False, "error": str(exc)})
+                except PermissionError as exc:
+                    self._json(403, {"ok": False, "error": str(exc)})
             elif path in {"/api/site-forensics", "/api/website-security-forensics"}:
                 with _c8_bounded_network_operation("Site Forensics"):
                     result = site_forensics_scan(payload)
@@ -43786,6 +44243,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.environ["LL_WEB_MYSQL_SSL_CA"] = _argv_value(argv, "--mysql-ca", required=True) or ""
     if "--digitalocean-database-id" in argv:
         os.environ["DIGITALOCEAN_DATABASE_ID"] = _argv_value(argv, "--digitalocean-database-id", required=True) or ""
+    if "--audit-integrity-check" in argv:
+        try:
+            key_path = _audit_integrity_key_path()
+            if key_path.is_symlink() or not key_path.is_file():
+                raise RuntimeError(f"Audit signing key missing at {key_path}. Restore the original key from backup before any further signing.")
+            key = _c8_load_existing_key(key_path)
+            previous = _audit_previous_hmac_keys()
+            with db_connection() as conn:
+                report = _audit_integrity_summary(conn, limit=200)
+            rows = list(report["tables"].values())
+            report["ok"] = all(row.get("ok") and row.get("columns_present") and not row.get("mismatch") and not row.get("unknown_algorithm") for row in rows)
+            report["current_key_id"] = hashlib.sha256(key).hexdigest()[:16]
+            report["previous_keys_loaded"] = len(previous)
+            report["note"] = "Read-only database check. Mismatched rows were not re-signed. Keep the current key for new rows. If a trusted older key backup exists, configure LL_WEB_AUDIT_PREVIOUS_HMAC_KEY_PATHS to verify older rows; investigate any remaining mismatches."
+            print(json.dumps(json_safe(report, max_str=20000), ensure_ascii=False, indent=2), flush=True)
+            return 0 if report["ok"] else 1
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": _redact_database_error(e)}, ensure_ascii=False, indent=2), file=sys.stderr, flush=True)
+            return 2
     if "--security-check" in argv:
         try:
             report = security_baseline_report()
