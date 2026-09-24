@@ -733,7 +733,7 @@ except Exception:
 AGENCY_NAME = "C-8"
 SYSTEM_NAME = "Console"
 # r20: GreyNoise Community integrated into Analyze; 404=no-record handling; verified scan rows synchronized.
-APP_VERSION = "3.46.0-c8-integrated-hardening-r107"
+APP_VERSION = "3.46.0-c8-integrated-hardening-r109"
 
 
 # ============================================================================
@@ -2044,6 +2044,13 @@ _IP_BAN_HISTORY: List[Dict[str, Any]] = []
 _IP_BANLIST_LOADED = False
 _IP_BANLIST_MTIME_NS = -1
 _IP_BANLIST_LOAD_ERROR = ""
+_IP_FIREWALL_LOCK = threading.Lock()
+_IP_FIREWALL_INSTALL_ATTEMPTED = False
+_IP_FIREWALL_THREAD_STARTED = False
+_IP_FIREWALL_STATUS: Dict[str, Any] = {
+    "ok": False, "active": False, "backend": "nftables",
+    "count": 0, "ports": [], "error": "Not synchronized yet.",
+}
 LOCAL_STATE_AES_ENABLED = os.environ.get("LL_WEB_LOCAL_STATE_AES256", "1").strip().lower() not in {"0", "false", "no", "off"}
 LOCAL_STATE_AES_KEY_PATH = Path(os.environ.get("LL_WEB_LOCAL_STATE_AES256_KEY", str(RUNTIME_DIR / "secrets" / "local_state_aes256.key"))).expanduser()
 LOCAL_STATE_KEY_PROTECTION = str(os.environ.get("LL_WEB_LOCAL_STATE_KEY_PROTECTION", "auto") or "auto").strip().lower()
@@ -3451,6 +3458,7 @@ def list_banned_ips() -> Dict[str, Any]:
         "encrypted": _local_state_aes_available(),
         "reload": "automatic",
         "load_error": _IP_BANLIST_LOAD_ERROR,
+        "firewall": dict(_IP_FIREWALL_STATUS),
     }
 
 
@@ -3493,7 +3501,7 @@ def ban_ip(subject: Any, reason: str = "", duration_seconds: int = 0) -> Dict[st
         })
         del _IP_BAN_HISTORY[:-500]
         _save_ip_banlist_locked()
-    return {"ok": True, "status": "banned", "ban": row}
+    return {"ok": True, "status": "banned", "ban": row, "firewall": _sync_ip_firewall_bans()}
 
 
 def unban_ip(subject: Any) -> Dict[str, Any]:
@@ -3510,7 +3518,8 @@ def unban_ip(subject: Any) -> Dict[str, Any]:
         })
         del _IP_BAN_HISTORY[:-500]
         _save_ip_banlist_locked()
-    return {"ok": bool(removed), "status": "unbanned" if removed else "not_found", "subject": clean}
+    return {"ok": bool(removed), "status": "unbanned" if removed else "not_found", "subject": clean,
+            "firewall": _sync_ip_firewall_bans()}
 
 
 def _ip_ban_match(value: Any) -> Optional[Dict[str, Any]]:
@@ -3568,6 +3577,164 @@ def _request_ip_ban_match(client_ip: str, headers: Any) -> Tuple[str, Optional[D
         if match:
             return normalized, match
     return "", None
+
+
+_IP_FIREWALL_TABLE = "c8_console_bans"
+_IP_FIREWALL_LAST_FINGERPRINT: Optional[Tuple[Any, ...]] = None
+
+
+def _ip_firewall_nft_binary(install: bool = False) -> str:
+    """Use a dedicated nftables table; never enable or rewrite the host firewall."""
+    global _IP_FIREWALL_INSTALL_ATTEMPTED
+    nft = shutil.which("nft") or next(
+        (path for path in ("/usr/sbin/nft", "/sbin/nft") if Path(path).is_file()), ""
+    )
+    if nft or not install or _IP_FIREWALL_INSTALL_ATTEMPTED:
+        return nft
+    _IP_FIREWALL_INSTALL_ATTEMPTED = True
+    if not _mysql_auto_install_enabled() or not _env_truthy("LL_WEB_IP_FIREWALL_AUTO_INSTALL", True):
+        return ""
+    apt = shutil.which("apt-get") or ""
+    if not apt:
+        return ""
+    print("IP firewall: installing Ubuntu's nftables package...", flush=True)
+    try:
+        result = subprocess.run(
+            [apt, "install", "-y", "--no-install-recommends", "nftables"],
+            capture_output=True, text=True, timeout=180, check=False,
+            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+        )
+        output = (result.stderr or "") + "\n" + (result.stdout or "")
+        if result.returncode and ("Unable to locate package" in output or "has no installation candidate" in output):
+            refresh = subprocess.run(
+                [apt, "update", "-qq"], capture_output=True, text=True, timeout=180,
+                check=False, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+            )
+            if refresh.returncode == 0:
+                result = subprocess.run(
+                    [apt, "install", "-y", "--no-install-recommends", "nftables"],
+                    capture_output=True, text=True, timeout=180, check=False,
+                    env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+                )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "apt-get failed").strip().splitlines()
+            print(f"IP firewall: nftables install failed: {(detail[-1] if detail else 'unknown error')[:300]}", file=sys.stderr, flush=True)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"IP firewall: nftables install failed: {exc}", file=sys.stderr, flush=True)
+    return shutil.which("nft") or next(
+        (path for path in ("/usr/sbin/nft", "/sbin/nft") if Path(path).is_file()), ""
+    )
+
+
+def _ip_firewall_table_exists(nft: str) -> bool:
+    result = subprocess.run(
+        [nft, "list", "table", "inet", _IP_FIREWALL_TABLE],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    if result.returncode == 0:
+        return True
+    detail = (result.stderr or result.stdout or "").strip()
+    if "No such file or directory" in detail or "does not exist" in detail.lower():
+        return False
+    raise RuntimeError(f"Cannot inspect nftables: {detail[:300] or 'unknown error'}")
+
+
+def _sync_ip_firewall_bans() -> Dict[str, Any]:
+    """Atomically drop banned clients on web ports, without touching SSH/UFW rules."""
+    global _IP_FIREWALL_STATUS, _IP_FIREWALL_LAST_FINGERPRINT
+    with _IP_FIREWALL_LOCK:
+        ports = sorted({int(PORT), int(TLS_ACME_HTTP_PORT)})
+        status: Dict[str, Any] = {
+            "ok": False, "active": False, "backend": "nftables",
+            "count": 0, "ports": ports, "error": "",
+        }
+        try:
+            report = list_banned_ips()
+            if not report.get("ok"):
+                raise RuntimeError("Encrypted IP ban state could not be read; existing firewall rules were left in place.")
+            enabled = _env_truthy("LL_WEB_IP_FIREWALL", True)
+            subjects = sorted({_normalize_ban_subject(row.get("subject")) for row in report["bans"]}) if enabled else []
+            status["count"] = len(subjects)
+            status["configured_count"] = int(report["count"])
+            status["disabled"] = not enabled
+            if os.name != "posix" or not sys.platform.startswith("linux"):
+                raise RuntimeError("Kernel firewall enforcement requires Linux; application bans remain active.")
+            if getattr(os, "geteuid", lambda: 1)() != 0:
+                raise RuntimeError("Kernel firewall enforcement requires root; application bans remain active.")
+            nft = _ip_firewall_nft_binary(install=bool(subjects))
+            if not nft:
+                if subjects:
+                    raise RuntimeError("nftables is unavailable. Install the nftables package or allow automatic dependency installation.")
+                raise RuntimeError("Cannot check for old firewall rules because nftables is unavailable.")
+            exists = _ip_firewall_table_exists(nft)
+            fingerprint: Tuple[Any, ...] = (tuple(subjects), tuple(ports), enabled)
+            if not subjects:
+                if exists:
+                    result = subprocess.run(
+                        [nft, "delete", "table", "inet", _IP_FIREWALL_TABLE],
+                        capture_output=True, text=True, timeout=20, check=False,
+                    )
+                    if result.returncode:
+                        raise RuntimeError((result.stderr or result.stdout or "Failed to remove obsolete firewall rules.").strip()[:300])
+                status.update(ok=True, active=False, count=0)
+            elif not exists or fingerprint != _IP_FIREWALL_LAST_FINGERPRINT:
+                ipv4 = [item for item in subjects if ipaddress.ip_network(item, strict=False).version == 4]
+                ipv6 = [item for item in subjects if item not in ipv4]
+                lines = []
+                if exists:
+                    lines.append(f"delete table inet {_IP_FIREWALL_TABLE}")
+                lines += [
+                    f"add table inet {_IP_FIREWALL_TABLE}",
+                    f"add set inet {_IP_FIREWALL_TABLE} banned_v4 {{ type ipv4_addr; flags interval; auto-merge; }}",
+                    f"add set inet {_IP_FIREWALL_TABLE} banned_v6 {{ type ipv6_addr; flags interval; auto-merge; }}",
+                    f"add chain inet {_IP_FIREWALL_TABLE} web_input {{ type filter hook input priority -150; policy accept; }}",
+                ]
+                if ipv4:
+                    lines.append(f"add element inet {_IP_FIREWALL_TABLE} banned_v4 {{ {', '.join(ipv4)} }}")
+                if ipv6:
+                    lines.append(f"add element inet {_IP_FIREWALL_TABLE} banned_v6 {{ {', '.join(ipv6)} }}")
+                port_set = (str(ports[0]) if len(ports) == 1 else "{ " + ", ".join(str(port) for port in ports) + " }")
+                lines.append(f"add rule inet {_IP_FIREWALL_TABLE} web_input ip saddr @banned_v4 tcp dport {port_set} drop")
+                lines.append(f"add rule inet {_IP_FIREWALL_TABLE} web_input ip6 saddr @banned_v6 tcp dport {port_set} drop")
+                result = subprocess.run(
+                    [nft, "-f", "-"], input="\n".join(lines) + "\n",
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError((result.stderr or result.stdout or "Failed to apply firewall rules.").strip()[:300])
+                if not _ip_firewall_table_exists(nft):
+                    raise RuntimeError("nftables reported success, but the IP ban table is missing.")
+                status.update(ok=True, active=True)
+            else:
+                status.update(ok=True, active=True)
+            _IP_FIREWALL_LAST_FINGERPRINT = fingerprint
+            status["synced_at"] = now_iso()
+        except Exception as exc:
+            _IP_FIREWALL_LAST_FINGERPRINT = None
+            status["error"] = str(exc)[:500]
+            status["last_known_active"] = bool(_IP_FIREWALL_STATUS.get("active"))
+        _IP_FIREWALL_STATUS = status
+        return dict(status)
+
+
+def _start_ip_firewall_monitor() -> None:
+    """Pick up bans from another CLI process and remove time-limited bans."""
+    global _IP_FIREWALL_THREAD_STARTED
+    if _IP_FIREWALL_THREAD_STARTED:
+        return
+    _IP_FIREWALL_THREAD_STARTED = True
+
+    def _monitor() -> None:
+        previous_error = ""
+        timer = threading.Event()
+        while not timer.wait(60):
+            result = _sync_ip_firewall_bans()
+            error = str(result.get("error") or "")
+            if error and error != previous_error:
+                print(f"IP firewall sync warning: {error}", file=sys.stderr, flush=True)
+            previous_error = error
+
+    threading.Thread(target=_monitor, name="c8-ip-firewall", daemon=True).start()
 
 
 def _path_is_html_document(path: str) -> bool:
@@ -9131,6 +9298,7 @@ def admin_security_overview(limit: int = 500, search: str = "") -> Dict[str, Any
         "persistent_ip_ban_history": ban_report.get("history") or [],
         "persistent_ip_ban_state_ok": bool(ban_report.get("ok")),
         "persistent_ip_ban_load_error": str(ban_report.get("load_error") or "")[:500],
+        "persistent_ip_firewall": ban_report.get("firewall") or {},
         "audit_integrity": audit_integrity,
         "configuration": {
             "ip_failure_threshold": LOGIN_MAX_FAILURES,
@@ -24453,17 +24621,68 @@ def _ff_import_yara() -> Any:
     return module
 
 
-def _ff_run_yara_pip(command: List[str], timeout: int) -> Tuple[int, str]:
+def _ff_run_yara_pip(command: List[str], timeout: int, pythonpath: str = "") -> Tuple[int, str]:
     # Keep build output off the console and out of unbounded in-memory buffers.
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "MAKEFLAGS": "-j1"}
+    if pythonpath:
+        env["PYTHONPATH"] = pythonpath
     with tempfile.TemporaryFile() as output:
         result = subprocess.run(
             command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-            timeout=timeout, check=False,
-            env={**os.environ, "PYTHONIOENCODING": "utf-8", "MAKEFLAGS": "-j1"},
+            timeout=timeout, check=False, env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         output.seek(max(0, output.tell() - 6000))
         return result.returncode, output.read().decode("utf-8", "replace").strip()
+
+
+def _ff_try_ubuntu_yara() -> Tuple[Any, str]:
+    """Use Ubuntu's compiled binding when apt targets this exact Python version."""
+    if sys.platform != "linux" or getattr(os, "geteuid", lambda: 1)() != 0:
+        return None, ""
+    apt = shutil.which("apt-get")
+    distro_python = Path("/usr/bin/python3")
+    if not apt or not distro_python.is_file():
+        return None, ""
+    try:
+        release = Path("/etc/os-release").read_text(encoding="utf-8")
+        if not re.search(r"(?m)^ID=['\"]?ubuntu['\"]?\s*$", release):
+            return None, ""
+        version_check = subprocess.run(
+            [str(distro_python), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True, text=True, timeout=6, check=False,
+        )
+        expected_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        if version_check.returncode or version_check.stdout.strip() != expected_version:
+            return None, ""
+        print("C-8 File Forensics: trying Ubuntu's prebuilt python3-yara package...", flush=True)
+        env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+
+        def run_apt(args: List[str], timeout: int) -> Tuple[int, str]:
+            with tempfile.TemporaryFile() as output:
+                result = subprocess.run(
+                    [apt, *args], stdin=subprocess.DEVNULL, stdout=output,
+                    stderr=subprocess.STDOUT, timeout=timeout, check=False, env=env,
+                )
+                output.seek(max(0, output.tell() - 1200))
+                return result.returncode, output.read().decode("utf-8", "replace").strip()
+
+        install_args = ["install", "-y", "--no-install-recommends", "python3-yara"]
+        code, output = run_apt(install_args, 180)
+        if code and "unable to locate package" in output.lower():
+            update_code, update_output = run_apt(["update", "-qq"], 180)
+            if update_code:
+                return None, f"Ubuntu package index update failed: {update_output[-500:]}"
+            code, output = run_apt(install_args, 180)
+        if code:
+            return None, f"Ubuntu python3-yara installation failed: {output[-650:]}"
+        sys.modules.pop("yara", None)
+        try:
+            return _ff_import_yara(), ""
+        except Exception as exc:
+            return None, f"Ubuntu installed python3-yara, but this Python cannot load it: {exc}"
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+        return None, f"Ubuntu python3-yara setup failed: {exc}"
 
 
 def _ff_ensure_yara() -> Any:
@@ -24493,26 +24712,45 @@ def _ff_ensure_yara() -> Any:
         _FF_YARA_INSTALL_ATTEMPTED = True
         try:
             _FF_YARA_DEPENDENCY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            distro_error = ""
+            if sys.version_info >= (3, 14):
+                distro_module, distro_error = _ff_try_ubuntu_yara()
+                if distro_module is not None:
+                    _FF_YARA_INSTALL_ERROR = ""
+                    print("C-8 File Forensics: YARA is ready from Ubuntu's package.", flush=True)
+                    return distro_module
             pip_command = [sys.executable, "-m", "pip"]
+            bundled_pip = ""
             if importlib.util.find_spec("pip") is None:
-                # Some Python builds bundle pip via ensurepip without installing it.
-                import ensurepip
-                wheels = sorted((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
-                if not wheels:
-                    raise RuntimeError("pip is missing for this Python. Install its pip/venv package, then restart the server.")
-                pip_command = [sys.executable, str(wheels[-1] / "pip")]
+                external_pip = shutil.which("pip3") or shutil.which("pip")
+                if external_pip:
+                    pip_command = [external_pip, "--python", sys.executable]
+                else:
+                    # Run the ensurepip wheel using this interpreter without
+                    # modifying the system's externally managed Python.
+                    try:
+                        import ensurepip
+                        wheels = sorted((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+                    except ImportError:
+                        wheels = []
+                    if not wheels:
+                        raise RuntimeError(
+                            "pip is missing for this Python. Install its pip/venv package, then restart the server. "
+                            + distro_error
+                        )
+                    bundled_pip = str(wheels[-1])
             command = pip_command + [
                 "--isolated", "install", "--disable-pip-version-check", "--no-input",
                 "--no-deps", "--no-compile", "--upgrade", "--timeout", "15", "--retries", "1",
                 "--index-url", "https://pypi.org/simple", "--target", str(_FF_YARA_DEPENDENCY_DIR),
             ]
             print("C-8 File Forensics: preparing yara-python for this Python runtime...", flush=True)
-            code, output = _ff_run_yara_pip(command + ["--only-binary=:all:", _FF_YARA_PACKAGE], 120)
+            code, output = _ff_run_yara_pip(command + ["--only-binary=:all:", _FF_YARA_PACKAGE], 120, bundled_pip)
             if code and any(message in output.lower() for message in ("no matching distribution", "could not find a version")):
                 print("C-8 File Forensics: no compatible YARA wheel; trying a source build...", flush=True)
-                code, output = _ff_run_yara_pip(command + [_FF_YARA_PACKAGE], 240)
+                code, output = _ff_run_yara_pip(command + [_FF_YARA_PACKAGE], 240, bundled_pip)
             if code:
-                raise RuntimeError(output[-2000:] or f"YARA installation exited with status {code}.")
+                raise RuntimeError((distro_error + " | " if distro_error else "") + (output[-2000:] or f"YARA installation exited with status {code}."))
             # A different package named 'yara' may already have been imported.
             sys.modules.pop("yara", None)
             module = _ff_import_yara()
@@ -24523,6 +24761,8 @@ def _ff_ensure_yara() -> Any:
             _FF_YARA_INSTALL_ERROR = "YARA setup timed out. Check package-index access and build tools, then restart the server to retry."
         except Exception as exc:
             _FF_YARA_INSTALL_ERROR = f"{type(exc).__name__}: {exc}"[:2400]
+        if _FF_YARA_INSTALL_ERROR:
+            print(f"C-8 File Forensics: YARA setup failed: {_FF_YARA_INSTALL_ERROR[:700]}", file=sys.stderr, flush=True)
         return None
 
 
@@ -36828,6 +37068,8 @@ function adminSecurityPaint(){
   const guards=(adminSecurityCache.guards||[]).filter(g=>!q||pretty(g).toLowerCase().includes(q));
   const floodGuards=[...(adminSecurityCache.request_guards||[]),...(adminSecurityCache.network_guards||[])].filter(g=>!q||pretty(g).toLowerCase().includes(q));
   const bans=(adminSecurityCache.persistent_ip_bans||[]).filter(b=>!q||pretty(b).toLowerCase().includes(q));
+  const ipFirewall=adminSecurityCache.persistent_ip_firewall||{};
+  const ipFirewallMessage=ipFirewall.active&&ipFirewall.ok?`Kernel firewall active: ${Number(ipFirewall.count||0)} IPs/networks blocked on TCP ${(ipFirewall.ports||[]).join(', ')}. SSH unaffected.`:`Kernel firewall ${ipFirewall.error?'sync failed':'inactive'}: ${esc(ipFirewall.error||(ipFirewall.disabled?'disabled by LL_WEB_IP_FIREWALL=0':'No firewall rules needed.'))} ${ipFirewall.last_known_active?'Previous firewall rules may still apply.':'Application bans still return HTTP 403.'}`;
   const banRows=bans.length?bans.map(b=>`<tr><td>${securityCode(b.subject||'N/A','ip')}</td><td>${esc(b.reason||'server policy')}</td><td>${esc(b.created_at||'N/A')}</td><td>${esc(b.expires_at||'Permanent')}</td><td>${securityChip(b.source||'server-cli','high')}</td></tr>`).join(''):'<tr><td colspan="5">No persistent server-side IP bans.</td></tr>';
   const banHistory=(adminSecurityCache.persistent_ip_ban_history||[]).filter(b=>!q||pretty(b).toLowerCase().includes(q));
   const banHistoryRows=banHistory.length?banHistory.map(b=>`<tr><td>${esc(b.created_at||'N/A')}</td><td>${securityChip(b.action||'changed',b.action==='unbanned'?'ok':'high')}</td><td>${securityCode(b.subject||'N/A','ip')}</td><td>${esc(b.reason||'N/A')}</td><td>${esc(b.operator||'server-operator')}</td><td>${esc(b.server||'N/A')}</td></tr>`).join(''):'<tr><td colspan="6">No VPS ban changes have been recorded.</td></tr>';
@@ -36848,7 +37090,7 @@ function adminSecurityPaint(){
   }).join(''):'<tr><td colspan="7">No active login guards.</td></tr>';
   const integrityTables=((adminSecurityCache.audit_integrity||{}).tables)||{};
   const integrityRows=Object.keys(integrityTables).length?Object.entries(integrityTables).map(([name,row])=>{const mismatch=Number(row.mismatch||0)+Number(row.unknown_algorithm||0);const legacy=Number(row.legacy_unsigned||0);const status=row.columns_present?(mismatch?securityChip('Mismatch','critical'):(legacy?securityChip('Mixed','medium'):securityChip('Verified','ok'))):securityChip('No columns','medium');return `<tr><td>${securityCode(name,'subject')}</td><td>${status}</td><td>${esc(row.verified??0)}</td><td>${securityCount(row.mismatch??0,1,1)}</td><td>${legacy?securityChip(String(legacy),'medium'):esc(0)}</td><td>${esc(row.sampled??0)}</td></tr>`;}).join(''):'<tr><td colspan="6">No integrity sample available.</td></tr>';
-  root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Mismatch</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
+  root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p><p class="tiny ${ipFirewall.active&&ipFirewall.ok?'ok':'bad'}">${ipFirewallMessage}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Mismatch</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
 }
 async function adminSecurityLoad(showErrors=true){
   if(!state.isAdmin){showLogin('Admin role required.');return;}
@@ -38153,7 +38395,7 @@ def _print_startup_diagnostics() -> None:
         f"{'enabled' if black_cloud_configuration['proxy_enabled'] else 'disabled'}.",
         flush=True,
     )
-    print("- Tools: --security-check, --tls-cert PATH --tls-key PATH, --mysql-ca PATH, --digitalocean-database-id UUID, --auth-diagnose [username], --create-user USERNAME [--admin], --remove-user USERNAME, --online-users, --ban-ip IP [--reason TEXT] [--ban-seconds N], --unban-ip IP, --list-banned-ips, --privacy-purge-ip IP, --ipdb-count, --ipdb-import [path].", flush=True)
+    print("- Tools: --security-check, --tls-cert PATH --tls-key PATH, --mysql-ca PATH, --digitalocean-database-id UUID, --auth-diagnose [username], --create-user USERNAME [--admin], --remove-user USERNAME, --online-users, --ban-ip IP [--reason TEXT] [--ban-seconds N], --unban-ip IP, --list-banned-ips, --sync-firewall-bans, --privacy-purge-ip IP, --ipdb-count, --ipdb-import [path].", flush=True)
     print("- Deny env: LL_WEB_DENY_CLIENT_CIDRS, LL_WEB_BLOCK_USER_AGENTS, LL_WEB_GOV_DENY_CIDRS, LL_WEB_BLOCK_GOV_NETWORKS=1, LL_WEB_GOV_RDAP_LOOKUP=1.", flush=True)
     print("- Keep this process running. If it stops, browsers get ERR_CONNECTION_REFUSED.", flush=True)
     print("=" * 72, flush=True)
@@ -43313,6 +43555,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if AESGCM is None or not LOCAL_STATE_AES_ENABLED:
         raise SystemExit("Encrypted local storage requires cryptography and LL_WEB_LOCAL_STATE_AES256=1.")
     _local_state_aes_key()  # Validate existing key without silently rotating it.
+    if "--sync-firewall-bans" in argv:
+        result = _sync_ip_firewall_bans()
+        print(json.dumps(json_safe(result, max_str=5000), ensure_ascii=False, indent=2), flush=True)
+        return 0 if result.get("ok") else 2
     if "--ban-ip" in argv:
         try:
             subject = _argv_value(argv, "--ban-ip", required=True) or ""
@@ -43320,7 +43566,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             duration_raw = _argv_value(argv, "--ban-seconds", required=False) or "0"
             result = ban_ip(subject, reason=reason, duration_seconds=int(duration_raw))
             print(json.dumps(json_safe(result, max_str=5000), ensure_ascii=False, indent=2), flush=True)
-            return 0
+            return 0 if result["firewall"].get("ok") else 2
         except Exception as e:
             print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False, indent=2), file=sys.stderr, flush=True)
             return 2
@@ -43329,13 +43575,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             subject = _argv_value(argv, "--unban-ip", required=True) or ""
             result = unban_ip(subject)
             print(json.dumps(json_safe(result, max_str=5000), ensure_ascii=False, indent=2), flush=True)
-            return 0 if result.get("ok") else 1
+            return (0 if result["firewall"].get("ok") else 2) if result.get("ok") else 1
         except Exception as e:
             print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False, indent=2), file=sys.stderr, flush=True)
             return 2
     if "--list-banned-ips" in argv:
-        print(json.dumps(json_safe(list_banned_ips(), max_str=10000), ensure_ascii=False, indent=2), flush=True)
-        return 0
+        firewall = _sync_ip_firewall_bans()
+        report = list_banned_ips()
+        print(json.dumps(json_safe(report, max_str=10000), ensure_ascii=False, indent=2), flush=True)
+        return 0 if report.get("ok") and (not report.get("count") or firewall.get("ok")) else 2
     if "--privacy-purge-ip" in argv:
         try:
             subject = _argv_value(argv, "--privacy-purge-ip", required=False) or DEFAULT_PRIVACY_SUPPRESSED_IPS
@@ -43426,6 +43674,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:
             print(json.dumps({"ok": False, "error": str(e), "database": db_descriptor(redact=True)}, ensure_ascii=False, indent=2), file=sys.stderr, flush=True)
             return 2
+    firewall = _sync_ip_firewall_bans()
+    if firewall.get("active"):
+        print(f"IP firewall: blocking {firewall['count']} banned IPs/networks on TCP {', '.join(map(str, firewall['ports']))}; SSH rules unchanged.", flush=True)
+    elif firewall.get("error") and (firewall.get("count") or not list_banned_ips().get("ok")):
+        print(f"IP firewall warning: {firewall['error']}", file=sys.stderr, flush=True)
+    _start_ip_firewall_monitor()
     if not _is_loopback_host(HOST) and not _public_access_enabled():
         raise SystemExit("Refusing to bind to a non-loopback host because LL_WEB_ALLOW_PUBLIC_BIND=0.")
     if TLS_REQUIRE_HTTPS:
