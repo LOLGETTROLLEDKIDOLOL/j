@@ -741,7 +741,7 @@ except Exception:
 AGENCY_NAME = "C-8"
 SYSTEM_NAME = "Console"
 # r20: GreyNoise Community integrated into Analyze; 404=no-record handling; verified scan rows synchronized.
-APP_VERSION = "3.46.0-c8-integrated-hardening-r116"
+APP_VERSION = "3.46.0-c8-integrated-hardening-r117"
 
 
 # ============================================================================
@@ -7866,6 +7866,8 @@ AUDIT_INTEGRITY_ALGORITHM = "HMAC-SHA256/server-keyed/audit-row-v1"
 AUDIT_INTEGRITY_TABLES = ("audit_events", "security_event_log", "visitor_access_log", "user_activity_log")
 _AUDIT_PREVIOUS_KEY_LOCK = threading.Lock()
 _AUDIT_PREVIOUS_KEY_CACHE: Tuple[str, Tuple[bytes, ...]] = ("", ())
+_AUDIT_ROTATION_CACHE: Optional[Dict[str, Any]] = None
+_AUDIT_ROTATION_CACHE_LOADED = False
 AUDIT_FIELD_AES256_ENABLED = os.environ.get("LL_WEB_AUDIT_AES256", "1").strip().lower() not in {"0", "false", "no", "off"}
 AUDIT_FIELD_AES256_PREFIX = "C8-AES256-GCM-1:"
 AUDIT_ENCRYPTED_FIELDS: Dict[str, Tuple[str, ...]] = {
@@ -7965,6 +7967,123 @@ def _audit_integrity_key_path() -> Path:
     return Path.home() / ".c8-console" / "secrets" / "audit_row_integrity_hmac_key"
 
 
+def _audit_rotation_paths() -> Tuple[Path, Path]:
+    key_path = _audit_integrity_key_path()
+    return (key_path.with_name("audit_key_loss_rotation.json"),
+            key_path.with_name("audit_key_loss_rotation.pending"))
+
+
+def _audit_rotation_signature(body: Dict[str, Any], key: bytes) -> str:
+    canonical = json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _audit_validate_rotation(body: Dict[str, Any], signature: str, key: bytes) -> Dict[str, Any]:
+    if (body.get("schema") != 1 or body.get("new_key_id") != hashlib.sha256(key).hexdigest()[:16]
+            or set(body.get("cutoff_ids", {})) != set(AUDIT_INTEGRITY_TABLES)
+            or any(type(body["cutoff_ids"][table]) is not int or body["cutoff_ids"][table] < 0
+                   for table in AUDIT_INTEGRITY_TABLES)
+            or not secrets.compare_digest(signature, _audit_rotation_signature(body, key))):
+        raise RuntimeError("Audit key rotation record is invalid. Restore it and its key from backup.")
+    return body
+
+
+def _audit_load_rotation() -> Optional[Dict[str, Any]]:
+    global _AUDIT_ROTATION_CACHE, _AUDIT_ROTATION_CACHE_LOADED
+    if _AUDIT_ROTATION_CACHE_LOADED:
+        return _AUDIT_ROTATION_CACHE
+    marker_path, _ = _audit_rotation_paths()
+    if marker_path.is_symlink() or marker_path.parent.is_symlink():
+        raise RuntimeError("Audit key rotation record must not be a symbolic link.")
+    if not marker_path.exists():
+        _AUDIT_ROTATION_CACHE_LOADED = True
+        return None
+    record = json.loads(_c8_read_secret(marker_path).decode("utf-8"))
+    key = _c8_load_existing_key(_audit_integrity_key_path())
+    _AUDIT_ROTATION_CACHE = _audit_validate_rotation(record.get("body", {}),
+                                                        str(record.get("signature", "")), key)
+    _AUDIT_ROTATION_CACHE_LOADED = True
+    return _AUDIT_ROTATION_CACHE
+
+
+def _audit_publish_missing_key(key_path: Path, key: bytes) -> None:
+    if key_path.is_symlink() or key_path.parent.is_symlink():
+        raise RuntimeError("Audit signing key path must not be a symbolic link.")
+    key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stage = key_path.with_name(key_path.name + ".new-" + secrets.token_hex(12))
+    try:
+        _atomic_write_secret(stage, _local_key_storage_bytes(key))
+        try:
+            os.link(stage, key_path)  # Never replace a key installed by another process.
+        except FileExistsError:
+            if _c8_load_existing_key(key_path) != key:
+                raise RuntimeError("Another audit signing key was installed concurrently; no key was replaced.")
+    finally:
+        stage.unlink(missing_ok=True)
+
+
+def _audit_finish_pending_rotation() -> bool:
+    """Complete an interrupted rotation before allowing any signed writes."""
+    global _AUDIT_ROTATION_CACHE, _AUDIT_ROTATION_CACHE_LOADED
+    marker_path, pending_path = _audit_rotation_paths()
+    if pending_path.is_symlink() or pending_path.parent.is_symlink():
+        raise RuntimeError("Audit key rotation recovery path must not be a symbolic link.")
+    if not pending_path.is_file():
+        return False
+    record = json.loads(_c8_read_secret(pending_path).decode("utf-8"))
+    key = base64.b64decode(str(record.get("key_base64", "")), validate=True)
+    if len(key) != 32:
+        raise RuntimeError("Pending audit key rotation is invalid.")
+    body = _audit_validate_rotation(record.get("body", {}), str(record.get("signature", "")), key)
+    key_path = _audit_integrity_key_path()
+    _audit_publish_missing_key(key_path, key)
+    if marker_path.is_symlink() or (marker_path.exists() and not marker_path.is_file()):
+        raise RuntimeError("Audit rotation marker path is unsafe.")
+    if marker_path.is_file():
+        existing = json.loads(_c8_read_secret(marker_path).decode("utf-8"))
+        if existing.get("body", {}).get("new_key_id") == body["new_key_id"]:
+            _AUDIT_ROTATION_CACHE, _AUDIT_ROTATION_CACHE_LOADED = None, False
+            _audit_load_rotation()  # An interrupted final write must still validate.
+            pending_path.unlink()
+            return True
+    # A prior marker belongs to the lost key; the new cutoff covers its rows too.
+    _atomic_write_secret(marker_path, json.dumps(
+        {"body": body, "signature": record["signature"]}, sort_keys=True).encode("utf-8"))
+    _AUDIT_ROTATION_CACHE, _AUDIT_ROTATION_CACHE_LOADED = None, False
+    _audit_load_rotation()
+    pending_path.unlink()
+    return True
+
+
+def _audit_rotate_missing_key(conn: Any, signed_counts: Dict[str, Dict[str, int]]) -> None:
+    key_path = _audit_integrity_key_path()
+    marker_path, pending_path = _audit_rotation_paths()
+    if marker_path.is_symlink() or pending_path.is_symlink():
+        raise RuntimeError("Audit rotation paths must not be symbolic links.")
+    # A new loss invalidates all signatures through the latest signed row, even if
+    # a prior rotation marker exists. Preserve the old marker until this succeeds.
+    key = secrets.token_bytes(32)
+    body = {
+        "schema": 1,
+        "rotated_at": now_iso(),
+        "reason": "previous audit signing key missing with signed history",
+        "new_key_id": hashlib.sha256(key).hexdigest()[:16],
+        "cutoff_ids": {table: int(signed_counts[table]["max_id"]) for table in AUDIT_INTEGRITY_TABLES},
+        "signed_rows_at_rotation": {table: int(signed_counts[table]["count"]) for table in AUDIT_INTEGRITY_TABLES},
+    }
+    signature = _audit_rotation_signature(body, key)
+    pending = {"body": body, "signature": signature, "key_base64": base64.b64encode(key).decode("ascii")}
+    _atomic_write_secret(pending_path, json.dumps(pending, sort_keys=True).encode("utf-8"))
+    _audit_finish_pending_rotation()
+    total = sum(row["count"] for row in signed_counts.values())
+    print(
+        f"Audit key recovery: generated a persistent new signing key at {key_path}. "
+        f"{total} older signed rows remain unverifiable; their signatures were not rewritten. "
+        f"Rotation record: {marker_path}. Back up both files for future versions.",
+        file=sys.stderr, flush=True,
+    )
+
+
 def _audit_previous_hmac_keys() -> Tuple[bytes, ...]:
     """Old signing keys verify existing rows; only the current key signs new rows."""
     global _AUDIT_PREVIOUS_KEY_CACHE
@@ -7988,21 +8107,29 @@ def _audit_previous_hmac_keys() -> Tuple[bytes, ...]:
 
 
 def _audit_assert_signing_key_not_lost(conn: Any) -> None:
-    """Do not silently mint a new signing key over existing signed history."""
+    """Start a documented new signing epoch if the old key was lost."""
     key_path = _audit_integrity_key_path()
     if key_path.is_symlink() or key_path.parent.is_symlink():
         raise RuntimeError("Audit signing key path must not be a symbolic link.")
     if key_path.is_file():
+        _audit_finish_pending_rotation()
+        _audit_load_rotation()
         return
     if key_path.exists():
         raise RuntimeError("Audit signing key path is not a regular file.")
+    if _audit_finish_pending_rotation():
+        _audit_load_rotation()
+        return
+    signed_counts: Dict[str, Dict[str, int]] = {}
     for table in AUDIT_INTEGRITY_TABLES:
-        row = db_fetchone(conn, f"SELECT {_db_ident('id')} FROM {_db_ident(table)} WHERE {_db_ident('integrity_tag')} IS NOT NULL AND {_db_ident('integrity_tag')} <> '' LIMIT 1")
-        if row:
-            raise RuntimeError(
-                f"Audit signing key is missing at {key_path}. Signed history exists in {table}; "
-                "restore the original key from backup before starting. No replacement was created."
-            )
+        row = db_fetchone(conn, f"SELECT MAX({_db_ident('id')}) AS max_id, COUNT(*) AS row_count FROM {_db_ident(table)} WHERE {_db_ident('integrity_tag')} IS NOT NULL AND {_db_ident('integrity_tag')} <> ''")
+        signed_counts[table] = {"max_id": int(_row_get(row, "max_id", 0) or 0),
+                                "count": int(_row_get(row, "row_count", 0) or 0)}
+    marker_path, _ = _audit_rotation_paths()
+    if any(entry["count"] for entry in signed_counts.values()) or marker_path.exists() or marker_path.is_symlink():
+        _audit_rotate_missing_key(conn, signed_counts)
+    else:
+        _server_hmac_key("audit_row_integrity_hmac_key")
 
 
 def _audit_integrity_tag(table: str, row: Dict[str, Any], *, key: Optional[bytes] = None) -> str:
@@ -8053,6 +8180,11 @@ def _audit_integrity_status(table: str, row: Dict[str, Any]) -> Dict[str, Any]:
         for old_key in keys:
             if secrets.compare_digest(stored, _audit_integrity_tag(table, variant, key=old_key)):
                 return {"signed": True, "verified": True, "status": "verified", "algorithm": alg or AUDIT_INTEGRITY_ALGORITHM, "previous_key": True, "legacy_numeric": bool(index)}
+    rotation = _audit_load_rotation()
+    if rotation and int(_row_get(row, "id", 0) or 0) <= rotation["cutoff_ids"].get(table, 0):
+        return {"signed": True, "verified": False, "status": "unverifiable_lost_key",
+                "algorithm": alg or AUDIT_INTEGRITY_ALGORITHM,
+                "note": "Signed before the original key was lost; the old tag was preserved."}
     return {"signed": True, "verified": False, "status": "mismatch", "algorithm": alg or AUDIT_INTEGRITY_ALGORITHM}
 
 
@@ -8088,6 +8220,10 @@ def _audit_integrity_summary(conn: Any, limit: int = 200) -> Dict[str, Any]:
         "sample_limit_per_table": limit,
         "tables": {},
     }
+    rotation = _audit_load_rotation()
+    if rotation:
+        summary["lost_key_rotation"] = {field: rotation[field] for field in
+                                         ("rotated_at", "new_key_id", "cutoff_ids", "signed_rows_at_rotation")}
     for table in AUDIT_INTEGRITY_TABLES:
         try:
             cols = db_table_columns(conn, table)
@@ -8096,12 +8232,12 @@ def _audit_integrity_summary(conn: Any, limit: int = 200) -> Dict[str, Any]:
             if not fields:
                 summary["tables"][table] = {"ok": False, "error": "No integrity field map available."}
                 continue
-            select_fields = fields + (["integrity_tag", "integrity_alg"] if has_integrity else [])
+            select_fields = ["id", *fields] + (["integrity_tag", "integrity_alg"] if has_integrity else [])
             rows = db_fetchall(
                 conn,
                 f"SELECT {', '.join(_db_ident(field) for field in select_fields)} FROM {_db_ident(table)} ORDER BY {_db_ident('id')} DESC LIMIT {limit}",
             )
-            counts = {"sampled": len(rows), "verified": 0, "verified_previous_key": 0, "verified_legacy_numeric": 0, "mismatch": 0, "legacy_unsigned": 0, "unknown_algorithm": 0}
+            counts = {"sampled": len(rows), "verified": 0, "verified_previous_key": 0, "verified_legacy_numeric": 0, "mismatch": 0, "unverifiable_lost_key": 0, "legacy_unsigned": 0, "unknown_algorithm": 0}
             date_ranges: Dict[str, Dict[str, str]] = {}
             for row in rows:
                 status = _audit_integrity_status(table, row)
@@ -8112,6 +8248,8 @@ def _audit_integrity_summary(conn: Any, limit: int = 200) -> Dict[str, Any]:
                     counts["verified_legacy_numeric"] += int(bool(status.get("legacy_numeric")))
                 elif state == "mismatch":
                     counts["mismatch"] += 1
+                elif state == "unverifiable_lost_key":
+                    counts["unverifiable_lost_key"] += 1
                 elif state == "unknown_algorithm":
                     counts["unknown_algorithm"] += 1
                 else:
@@ -8669,6 +8807,8 @@ def _prune_precise_location_retention(conn: Any, cutoff: str) -> Dict[str, int]:
             f"SELECT {', '.join(_db_ident(field) for field in select_fields)} FROM {_db_ident('visitor_access_log')} WHERE {_db_ident('event_at')} IS NOT NULL AND {_db_ident('event_at')} <> '' AND {_db_ident('event_at')} < ?",
             (cutoff,),
         )
+        rotation = _audit_load_rotation()
+        old_signed_cutoff = (rotation or {}).get("cutoff_ids", {}).get("visitor_access_log", 0)
         for row in rows:
             clear = _audit_decrypt_field("visitor_access_log", "device_json", _row_get(row, "device_json", ""))
             try:
@@ -8679,6 +8819,16 @@ def _prune_precise_location_retention(conn: Any, cutoff: str) -> Dict[str, int]:
                 continue
             clear_json = json.dumps(json_safe(payload, max_str=5000), ensure_ascii=False)
             protected_json = _audit_encrypt_field("visitor_access_log", "device_json", clear_json)
+            if old_signed_cutoff and int(_row_get(row, "id", 0) or 0) <= old_signed_cutoff and _row_get(row, "integrity_tag"):
+                # Required retention redaction must not launder an old signature
+                # into a new-key signature. Keep the original tag and lost-key status.
+                db_execute(
+                    conn,
+                    f"UPDATE {_db_ident('visitor_access_log')} SET {_db_ident('device_json')} = ? WHERE {_db_ident('id')} = ?",
+                    (protected_json, _row_get(row, "id")),
+                )
+                redacted["visitor_access_log"] += 1
+                continue
             integrity_row = {field: _row_get(row, field) for field in fields}
             integrity_row["device_json"] = protected_json
             integrity_tag = _audit_integrity_tag("visitor_access_log", integrity_row)
@@ -37724,9 +37874,10 @@ function adminSecurityPaint(){
   }).join(''):'<tr><td colspan="8">No login guards match.</td></tr>';
   const integrityTables=((adminSecurityCache.audit_integrity||{}).tables)||{};
   const integrityMismatch=Object.values(integrityTables).reduce((n,row)=>n+Number(row.mismatch||0)+Number(row.unknown_algorithm||0),0);
-  const integrityNote=integrityMismatch?`<p class="tiny bad">${integrityMismatch} sampled records cannot be verified. Check the original audit signing key and run --audit-integrity-check on the VPS. No mismatched records have been re-signed.</p>`:'';
-  const integrityRows=Object.keys(integrityTables).length?Object.entries(integrityTables).map(([name,row])=>{const mismatch=Number(row.mismatch||0)+Number(row.unknown_algorithm||0);const legacy=Number(row.legacy_unsigned||0);const status=row.columns_present?(mismatch?securityChip('Mismatch','critical'):(legacy?securityChip('Mixed','medium'):securityChip('Verified','ok'))):securityChip('No columns','medium');return `<tr><td>${securityCode(name,'subject')}</td><td>${status}</td><td>${esc(row.verified??0)}</td><td>${esc(row.verified_previous_key??0)}</td><td>${esc(row.verified_legacy_numeric??0)}</td><td>${securityCount(row.mismatch??0,1,1)}</td><td>${legacy?securityChip(String(legacy),'medium'):esc(0)}</td><td>${esc(row.sampled??0)}</td></tr>`;}).join(''):'<tr><td colspan="8">No integrity sample available.</td></tr>';
-  root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><p class="tiny muted">Ban only IP subjects. Account and combined guards do not contain an IP address.</p><div class="actions" style="margin:0 0 12px"><button class="secondary-btn" type="button" onclick="adminSecurityBanGuardIPs()" ${guardIPs.length?'':'disabled'}>Ban ${guardIPs.length} displayed guard IP${guardIPs.length===1?'':'s'}</button></div><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th><th>Action</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th><th>Action</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p><p class="tiny ${ipFirewall.active&&ipFirewall.ok?'ok':'bad'}">${ipFirewallMessage}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3>${integrityNote}<div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Prior key</th><th>Legacy numeric</th><th>Mismatch</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
+  const integrityLost=Object.values(integrityTables).reduce((n,row)=>n+Number(row.unverifiable_lost_key||0),0);
+  const integrityNote=(integrityLost?`<p class="tiny bad">${integrityLost} sampled older signatures are unverifiable because their signing key was lost. The rows and old signatures remain unchanged; new rows use the persistent replacement key.</p>`:'')+(integrityMismatch?`<p class="tiny bad">${integrityMismatch} sampled records show an integrity mismatch or unknown algorithm. Investigate with --audit-integrity-check; no mismatched records were re-signed.</p>`:'');
+  const integrityRows=Object.keys(integrityTables).length?Object.entries(integrityTables).map(([name,row])=>{const mismatch=Number(row.mismatch||0)+Number(row.unknown_algorithm||0);const legacy=Number(row.legacy_unsigned||0);const lost=Number(row.unverifiable_lost_key||0);const status=row.columns_present?(mismatch?securityChip('Mismatch','critical'):(lost?securityChip('Lost key','medium'):(legacy?securityChip('Mixed','medium'):securityChip('Verified','ok')))):securityChip('No columns','medium');return `<tr><td>${securityCode(name,'subject')}</td><td>${status}</td><td>${esc(row.verified??0)}</td><td>${esc(row.verified_previous_key??0)}</td><td>${esc(row.verified_legacy_numeric??0)}</td><td>${securityCount(row.mismatch??0,1,1)}</td><td>${lost?securityChip(String(lost),'medium'):esc(0)}</td><td>${legacy?securityChip(String(legacy),'medium'):esc(0)}</td><td>${esc(row.sampled??0)}</td></tr>`;}).join(''):'<tr><td colspan="9">No integrity sample available.</td></tr>';
+  root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><p class="tiny muted">Ban only IP subjects. Account and combined guards do not contain an IP address.</p><div class="actions" style="margin:0 0 12px"><button class="secondary-btn" type="button" onclick="adminSecurityBanGuardIPs()" ${guardIPs.length?'':'disabled'}>Ban ${guardIPs.length} displayed guard IP${guardIPs.length===1?'':'s'}</button></div><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th><th>Action</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th><th>Action</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p><p class="tiny ${ipFirewall.active&&ipFirewall.ok?'ok':'bad'}">${ipFirewallMessage}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3>${integrityNote}<div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Prior key</th><th>Legacy numeric</th><th>Mismatch</th><th>Lost key</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
 }
 let adminBanRequestBusy=false;
 async function adminSecurityBanGuardIP(ip){
@@ -44276,10 +44427,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             with db_connection() as conn:
                 report = _audit_integrity_summary(conn, limit=200)
             rows = list(report["tables"].values())
-            report["ok"] = all(row.get("ok") and row.get("columns_present") and not row.get("mismatch") and not row.get("unknown_algorithm") for row in rows)
+            report["ok"] = all(row.get("ok") and row.get("columns_present") and not row.get("mismatch") and not row.get("unknown_algorithm") and not row.get("unverifiable_lost_key") for row in rows)
+            report["new_epoch_ok"] = all(row.get("ok") and row.get("columns_present") and not row.get("mismatch") and not row.get("unknown_algorithm") for row in rows)
             report["current_key_id"] = hashlib.sha256(key).hexdigest()[:16]
             report["previous_keys_loaded"] = len(previous)
-            report["note"] = "Read-only database check. Mismatched rows were not re-signed. Keep the current key for new rows. If a trusted older key backup exists, configure LL_WEB_AUDIT_PREVIOUS_HMAC_KEY_PATHS to verify older rows; investigate any remaining mismatches."
+            report["note"] = "Read-only database check. Rows signed before a lost-key rotation remain explicitly unverifiable unless an original key backup is provided through LL_WEB_AUDIT_PREVIOUS_HMAC_KEY_PATHS. Old signatures were not rewritten. Back up the current audit key and its rotation marker for future versions. Any actual mismatches in the new epoch still need investigation."
             print(json.dumps(json_safe(report, max_str=20000), ensure_ascii=False, indent=2), flush=True)
             return 0 if report["ok"] else 1
         except Exception as e:
