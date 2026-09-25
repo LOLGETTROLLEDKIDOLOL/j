@@ -1083,15 +1083,15 @@ def _c8_bounded_network_operation(name: str):
 # C8_VIRUSTOTAL_API_KEY = "paste-key-here"
 #
 # Do not commit/share a copy of this file after putting real keys directly here.
-C8_VIRUSTOTAL_API_KEY = ""
-C8_ABUSEIPDB_API_KEY = ""
+C8_VIRUSTOTAL_API_KEY = "cc121eea345151d3cb3f42ea65290be56f10b9b3f45146f2da4fba31c4e45585"
+C8_ABUSEIPDB_API_KEY = "b5266f1379db4e4b51728fed43e75eab3155dd0885fe2a2e45165ba4a3afc4040f5f4d616583c004"
 C8_GREYNOISE_API_KEY = ""
 # Free/Community API key. This is separate so a Community-tier key can be used
 # without pretending it has access to the full /v3/ip response.
 C8_GREYNOISE_COMMUNITY_API_KEY = ""
-C8_IPHUB_API_KEY = ""
-C8_APILAYER_API_KEY = ""
-C8_GLOBALPING_API_KEY = ""
+C8_IPHUB_API_KEY = "MjcxNTE6RlNYaDhlaHFzcFdOWk4zT3Y4czlkWTFjVjByUlhOeGU"
+C8_APILAYER_API_KEY = "7yOi95mUliASxbiPK8oyIFDPUUidlZaz"
+C8_GLOBALPING_API_KEY = "vyfnmsujzd7lo2vvc3c5zktckpvc6vzv"
 
 # The application also recognizes the environment aliases:
 # VT_API_KEY or VIRUSTOTAL_API_KEY; ABUSEIPDB_API_KEY or ABUSEIPDB_KEY;
