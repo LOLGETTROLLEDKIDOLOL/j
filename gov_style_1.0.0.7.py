@@ -741,7 +741,7 @@ except Exception:
 AGENCY_NAME = "C-8"
 SYSTEM_NAME = "Console"
 # r20: GreyNoise Community integrated into Analyze; 404=no-record handling; verified scan rows synchronized.
-APP_VERSION = "3.46.0-c8-integrated-hardening-r118"
+APP_VERSION = "3.46.0-c8-integrated-hardening-r119"
 
 
 # ============================================================================
@@ -9615,10 +9615,12 @@ def admin_security_overview(limit: int = 500, search: str = "") -> Dict[str, Any
                    username_attempted, request_method, request_path, user_agent, details_json
                    {integrity_select}
               FROM security_event_log
-             WHERE event_type IN (?, ?)
+             WHERE event_type IN (?, ?, ?, ?, ?)
              ORDER BY id DESC
              LIMIT 250
-        """, ("possible_screenshot_shortcut_ctrl_shift", "possible_screenshot_shortcut_print_screen"))
+        """, tuple("possible_screenshot_shortcut_" + shortcut for shortcut in (
+            "ctrl_shift", "print_screen", "system_snip", "mac_capture", "print_dialog",
+        )))
         guards = db_fetchall(conn, """
             SELECT guard_kind, subject_hint, failure_count, window_started_epoch,
                    blocked_until_epoch, last_failure_epoch, distinct_json, reason, updated_at
@@ -32818,6 +32820,8 @@ body.theme-dark .black-cloud-member.active{background:#10233a;border-color:#4c6f
 
     /* Visible site-wide restriction; print previews contain no console data. */
     .c8-no-screenshots{position:fixed;z-index:10000;right:10px;bottom:10px;padding:6px 10px;border:2px solid #fff;background:#8a1f1f;color:#fff;box-shadow:0 4px 18px #0006;font:800 .74rem/1.25 Arial,sans-serif;letter-spacing:.03em;pointer-events:none}
+    .c8-capture-watermark{position:fixed;inset:0;width:100%;height:100%;z-index:9990;pointer-events:none;display:none;opacity:.18}
+    .c8-capture-watermark.active{display:block}
     .c8-privacy-controls{display:grid;gap:10px}.c8-privacy-controls label{display:flex;align-items:flex-start;gap:10px;cursor:pointer;line-height:1.4}.c8-privacy-controls input[type="checkbox"]{width:18px;height:18px;flex:none;margin:1px 0}.c8-privacy-controls p{margin:0;color:var(--muted)}
     .c8-privacy-value{display:inline-block;max-width:100%;vertical-align:baseline;white-space:pre-wrap;overflow-wrap:anywhere}.c8-privacy-blur .c8-privacy-value:not(:hover):not(:focus):not([data-c8-revealed="true"]){filter:blur(7px);user-select:none;-webkit-user-select:none;cursor:pointer}.c8-privacy-blur .c8-privacy-field:not(:hover):not(:focus){filter:blur(7px)}
     body.c8-capture-veil::after{content:"SENSITIVE CONTENT HIDDEN WHILE THE WINDOW IS INACTIVE";position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:24px;text-align:center;background:#071a33;color:#fff;font:800 clamp(1rem,3vw,1.5rem)/1.4 Arial,sans-serif;letter-spacing:.06em;pointer-events:none}
@@ -32832,6 +32836,7 @@ body.theme-dark .black-cloud-member.active{background:#10233a;border-color:#4c6f
   <div class="us-site-banner" role="note" aria-label="Site location notice"><div class="us-site-banner-inner"><img class="us-site-banner-flag" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA3NDEgMzkwIiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlVuaXRlZCBTdGF0ZXMgZmxhZyI+PHJlY3QgeD0iMCIgeT0iMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjMwIiB3aWR0aD0iNzQxIiBoZWlnaHQ9IjMwIiBmaWxsPSIjRkZGRkZGIi8+PHJlY3QgeD0iMCIgeT0iNjAiIHdpZHRoPSI3NDEiIGhlaWdodD0iMzAiIGZpbGw9IiNCMzE5NDIiLz48cmVjdCB4PSIwIiB5PSI5MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjEyMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjE1MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjE4MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjIxMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjI0MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjI3MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjMwMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjMzMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjM2MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjAiIHdpZHRoPSIyOTYuNCIgaGVpZ2h0PSIyMTAiIGZpbGw9IiMwQTMxNjEiLz48cG9seWdvbiBwb2ludHM9IjI0LjcwLDExLjAwIDI2LjM1LDE1LjczIDMxLjM2LDE1Ljg0IDI3LjM2LDE4Ljg3IDI4LjgxLDIzLjY2IDI0LjcwLDIwLjgwIDIwLjU5LDIzLjY2IDIyLjA0LDE4Ljg3IDE4LjA0LDE1Ljg0IDIzLjA1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxMS4wMCA3NS43NSwxNS43MyA4MC43NiwxNS44NCA3Ni43NiwxOC44NyA3OC4yMSwyMy42NiA3NC4xMCwyMC44MCA2OS45OSwyMy42NiA3MS40NCwxOC44NyA2Ny40NCwxNS44NCA3Mi40NSwxNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTIzLjUwLDExLjAwIDEyNS4xNSwxNS43MyAxMzAuMTYsMTUuODQgMTI2LjE2LDE4Ljg3IDEyNy42MSwyMy42NiAxMjMuNTAsMjAuODAgMTE5LjM5LDIzLjY2IDEyMC44NCwxOC44NyAxMTYuODQsMTUuODQgMTIxLjg1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxNzIuOTAsMTEuMDAgMTc0LjU1LDE1LjczIDE3OS41NiwxNS44NCAxNzUuNTYsMTguODcgMTc3LjAxLDIzLjY2IDE3Mi45MCwyMC44MCAxNjguNzksMjMuNjYgMTcwLjI0LDE4Ljg3IDE2Ni4yNCwxNS44NCAxNzEuMjUsMTUuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxMS4wMCAyMjMuOTUsMTUuNzMgMjI4Ljk2LDE1Ljg0IDIyNC45NiwxOC44NyAyMjYuNDEsMjMuNjYgMjIyLjMwLDIwLjgwIDIxOC4xOSwyMy42NiAyMTkuNjQsMTguODcgMjE1LjY0LDE1Ljg0IDIyMC42NSwxNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjcxLjcwLDExLjAwIDI3My4zNSwxNS43MyAyNzguMzYsMTUuODQgMjc0LjM2LDE4Ljg3IDI3NS44MSwyMy42NiAyNzEuNzAsMjAuODAgMjY3LjU5LDIzLjY2IDI2OS4wNCwxOC44NyAyNjUuMDQsMTUuODQgMjcwLjA1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI0OS40MCwzMy4wMCA1MS4wNSwzNy43MyA1Ni4wNiwzNy44NCA1Mi4wNiw0MC44NyA1My41MSw0NS42NiA0OS40MCw0Mi44MCA0NS4yOSw0NS42NiA0Ni43NCw0MC44NyA0Mi43NCwzNy44NCA0Ny43NSwzNy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMzMuMDAgMTAwLjQ1LDM3LjczIDEwNS40NiwzNy44NCAxMDEuNDYsNDAuODcgMTAyLjkxLDQ1LjY2IDk4LjgwLDQyLjgwIDk0LjY5LDQ1LjY2IDk2LjE0LDQwLjg3IDkyLjE0LDM3Ljg0IDk3LjE1LDM3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxNDguMjAsMzMuMDAgMTQ5Ljg1LDM3LjczIDE1NC44NiwzNy44NCAxNTAuODYsNDAuODcgMTUyLjMxLDQ1LjY2IDE0OC4yMCw0Mi44MCAxNDQuMDksNDUuNjYgMTQ1LjU0LDQwLjg3IDE0MS41NCwzNy44NCAxNDYuNTUsMzcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE5Ny42MCwzMy4wMCAxOTkuMjUsMzcuNzMgMjA0LjI2LDM3Ljg0IDIwMC4yNiw0MC44NyAyMDEuNzEsNDUuNjYgMTk3LjYwLDQyLjgwIDE5My40OSw0NS42NiAxOTQuOTQsNDAuODcgMTkwLjk0LDM3Ljg0IDE5NS45NSwzNy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDMzLjAwIDI0OC42NSwzNy43MyAyNTMuNjYsMzcuODQgMjQ5LjY2LDQwLjg3IDI1MS4xMSw0NS42NiAyNDcuMDAsNDIuODAgMjQyLjg5LDQ1LjY2IDI0NC4zNCw0MC44NyAyNDAuMzQsMzcuODQgMjQ1LjM1LDM3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyNC43MCw1NS4wMCAyNi4zNSw1OS43MyAzMS4zNiw1OS44NCAyNy4zNiw2Mi44NyAyOC44MSw2Ny42NiAyNC43MCw2NC44MCAyMC41OSw2Ny42NiAyMi4wNCw2Mi44NyAxOC4wNCw1OS44NCAyMy4wNSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iNzQuMTAsNTUuMDAgNzUuNzUsNTkuNzMgODAuNzYsNTkuODQgNzYuNzYsNjIuODcgNzguMjEsNjcuNjYgNzQuMTAsNjQuODAgNjkuOTksNjcuNjYgNzEuNDQsNjIuODcgNjcuNDQsNTkuODQgNzIuNDUsNTkuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCw1NS4wMCAxMjUuMTUsNTkuNzMgMTMwLjE2LDU5Ljg0IDEyNi4xNiw2Mi44NyAxMjcuNjEsNjcuNjYgMTIzLjUwLDY0LjgwIDExOS4zOSw2Ny42NiAxMjAuODQsNjIuODcgMTE2Ljg0LDU5Ljg0IDEyMS44NSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTcyLjkwLDU1LjAwIDE3NC41NSw1OS43MyAxNzkuNTYsNTkuODQgMTc1LjU2LDYyLjg3IDE3Ny4wMSw2Ny42NiAxNzIuOTAsNjQuODAgMTY4Ljc5LDY3LjY2IDE3MC4yNCw2Mi44NyAxNjYuMjQsNTkuODQgMTcxLjI1LDU5LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyMjIuMzAsNTUuMDAgMjIzLjk1LDU5LjczIDIyOC45Niw1OS44NCAyMjQuOTYsNjIuODcgMjI2LjQxLDY3LjY2IDIyMi4zMCw2NC44MCAyMTguMTksNjcuNjYgMjE5LjY0LDYyLjg3IDIxNS42NCw1OS44NCAyMjAuNjUsNTkuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCw1NS4wMCAyNzMuMzUsNTkuNzMgMjc4LjM2LDU5Ljg0IDI3NC4zNiw2Mi44NyAyNzUuODEsNjcuNjYgMjcxLjcwLDY0LjgwIDI2Ny41OSw2Ny42NiAyNjkuMDQsNjIuODcgMjY1LjA0LDU5Ljg0IDI3MC4wNSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iNDkuNDAsNzcuMDAgNTEuMDUsODEuNzMgNTYuMDYsODEuODQgNTIuMDYsODQuODcgNTMuNTEsODkuNjYgNDkuNDAsODYuODAgNDUuMjksODkuNjYgNDYuNzQsODQuODcgNDIuNzQsODEuODQgNDcuNzUsODEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9Ijk4LjgwLDc3LjAwIDEwMC40NSw4MS43MyAxMDUuNDYsODEuODQgMTAxLjQ2LDg0Ljg3IDEwMi45MSw4OS42NiA5OC44MCw4Ni44MCA5NC42OSw4OS42NiA5Ni4xNCw4NC44NyA5Mi4xNCw4MS44NCA5Ny4xNSw4MS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDc3LjAwIDE0OS44NSw4MS43MyAxNTQuODYsODEuODQgMTUwLjg2LDg0Ljg3IDE1Mi4zMSw4OS42NiAxNDguMjAsODYuODAgMTQ0LjA5LDg5LjY2IDE0NS41NCw4NC44NyAxNDEuNTQsODEuODQgMTQ2LjU1LDgxLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxOTcuNjAsNzcuMDAgMTk5LjI1LDgxLjczIDIwNC4yNiw4MS44NCAyMDAuMjYsODQuODcgMjAxLjcxLDg5LjY2IDE5Ny42MCw4Ni44MCAxOTMuNDksODkuNjYgMTk0Ljk0LDg0Ljg3IDE5MC45NCw4MS44NCAxOTUuOTUsODEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI0Ny4wMCw3Ny4wMCAyNDguNjUsODEuNzMgMjUzLjY2LDgxLjg0IDI0OS42Niw4NC44NyAyNTEuMTEsODkuNjYgMjQ3LjAwLDg2LjgwIDI0Mi44OSw4OS42NiAyNDQuMzQsODQuODcgMjQwLjM0LDgxLjg0IDI0NS4zNSw4MS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsOTkuMDAgMjYuMzUsMTAzLjczIDMxLjM2LDEwMy44NCAyNy4zNiwxMDYuODcgMjguODEsMTExLjY2IDI0LjcwLDEwOC44MCAyMC41OSwxMTEuNjYgMjIuMDQsMTA2Ljg3IDE4LjA0LDEwMy44NCAyMy4wNSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9Ijc0LjEwLDk5LjAwIDc1Ljc1LDEwMy43MyA4MC43NiwxMDMuODQgNzYuNzYsMTA2Ljg3IDc4LjIxLDExMS42NiA3NC4xMCwxMDguODAgNjkuOTksMTExLjY2IDcxLjQ0LDEwNi44NyA2Ny40NCwxMDMuODQgNzIuNDUsMTAzLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxMjMuNTAsOTkuMDAgMTI1LjE1LDEwMy43MyAxMzAuMTYsMTAzLjg0IDEyNi4xNiwxMDYuODcgMTI3LjYxLDExMS42NiAxMjMuNTAsMTA4LjgwIDExOS4zOSwxMTEuNjYgMTIwLjg0LDEwNi44NyAxMTYuODQsMTAzLjg0IDEyMS44NSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCw5OS4wMCAxNzQuNTUsMTAzLjczIDE3OS41NiwxMDMuODQgMTc1LjU2LDEwNi44NyAxNzcuMDEsMTExLjY2IDE3Mi45MCwxMDguODAgMTY4Ljc5LDExMS42NiAxNzAuMjQsMTA2Ljg3IDE2Ni4yNCwxMDMuODQgMTcxLjI1LDEwMy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjIyLjMwLDk5LjAwIDIyMy45NSwxMDMuNzMgMjI4Ljk2LDEwMy44NCAyMjQuOTYsMTA2Ljg3IDIyNi40MSwxMTEuNjYgMjIyLjMwLDEwOC44MCAyMTguMTksMTExLjY2IDIxOS42NCwxMDYuODcgMjE1LjY0LDEwMy44NCAyMjAuNjUsMTAzLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyNzEuNzAsOTkuMDAgMjczLjM1LDEwMy43MyAyNzguMzYsMTAzLjg0IDI3NC4zNiwxMDYuODcgMjc1LjgxLDExMS42NiAyNzEuNzAsMTA4LjgwIDI2Ny41OSwxMTEuNjYgMjY5LjA0LDEwNi44NyAyNjUuMDQsMTAzLjg0IDI3MC4wNSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjQ5LjQwLDEyMS4wMCA1MS4wNSwxMjUuNzMgNTYuMDYsMTI1Ljg0IDUyLjA2LDEyOC44NyA1My41MSwxMzMuNjYgNDkuNDAsMTMwLjgwIDQ1LjI5LDEzMy42NiA0Ni43NCwxMjguODcgNDIuNzQsMTI1Ljg0IDQ3Ljc1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMTIxLjAwIDEwMC40NSwxMjUuNzMgMTA1LjQ2LDEyNS44NCAxMDEuNDYsMTI4Ljg3IDEwMi45MSwxMzMuNjYgOTguODAsMTMwLjgwIDk0LjY5LDEzMy42NiA5Ni4xNCwxMjguODcgOTIuMTQsMTI1Ljg0IDk3LjE1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDEyMS4wMCAxNDkuODUsMTI1LjczIDE1NC44NiwxMjUuODQgMTUwLjg2LDEyOC44NyAxNTIuMzEsMTMzLjY2IDE0OC4yMCwxMzAuODAgMTQ0LjA5LDEzMy42NiAxNDUuNTQsMTI4Ljg3IDE0MS41NCwxMjUuODQgMTQ2LjU1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTk3LjYwLDEyMS4wMCAxOTkuMjUsMTI1LjczIDIwNC4yNiwxMjUuODQgMjAwLjI2LDEyOC44NyAyMDEuNzEsMTMzLjY2IDE5Ny42MCwxMzAuODAgMTkzLjQ5LDEzMy42NiAxOTQuOTQsMTI4Ljg3IDE5MC45NCwxMjUuODQgMTk1Ljk1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDEyMS4wMCAyNDguNjUsMTI1LjczIDI1My42NiwxMjUuODQgMjQ5LjY2LDEyOC44NyAyNTEuMTEsMTMzLjY2IDI0Ny4wMCwxMzAuODAgMjQyLjg5LDEzMy42NiAyNDQuMzQsMTI4Ljg3IDI0MC4zNCwxMjUuODQgMjQ1LjM1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsMTQzLjAwIDI2LjM1LDE0Ny43MyAzMS4zNiwxNDcuODQgMjcuMzYsMTUwLjg3IDI4LjgxLDE1NS42NiAyNC43MCwxNTIuODAgMjAuNTksMTU1LjY2IDIyLjA0LDE1MC44NyAxOC4wNCwxNDcuODQgMjMuMDUsMTQ3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxNDMuMDAgNzUuNzUsMTQ3LjczIDgwLjc2LDE0Ny44NCA3Ni43NiwxNTAuODcgNzguMjEsMTU1LjY2IDc0LjEwLDE1Mi44MCA2OS45OSwxNTUuNjYgNzEuNDQsMTUwLjg3IDY3LjQ0LDE0Ny44NCA3Mi40NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCwxNDMuMDAgMTI1LjE1LDE0Ny43MyAxMzAuMTYsMTQ3Ljg0IDEyNi4xNiwxNTAuODcgMTI3LjYxLDE1NS42NiAxMjMuNTAsMTUyLjgwIDExOS4zOSwxNTUuNjYgMTIwLjg0LDE1MC44NyAxMTYuODQsMTQ3Ljg0IDEyMS44NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCwxNDMuMDAgMTc0LjU1LDE0Ny43MyAxNzkuNTYsMTQ3Ljg0IDE3NS41NiwxNTAuODcgMTc3LjAxLDE1NS42NiAxNzIuOTAsMTUyLjgwIDE2OC43OSwxNTUuNjYgMTcwLjI0LDE1MC44NyAxNjYuMjQsMTQ3Ljg0IDE3MS4yNSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxNDMuMDAgMjIzLjk1LDE0Ny43MyAyMjguOTYsMTQ3Ljg0IDIyNC45NiwxNTAuODcgMjI2LjQxLDE1NS42NiAyMjIuMzAsMTUyLjgwIDIxOC4xOSwxNTUuNjYgMjE5LjY0LDE1MC44NyAyMTUuNjQsMTQ3Ljg0IDIyMC42NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCwxNDMuMDAgMjczLjM1LDE0Ny43MyAyNzguMzYsMTQ3Ljg0IDI3NC4zNiwxNTAuODcgMjc1LjgxLDE1NS42NiAyNzEuNzAsMTUyLjgwIDI2Ny41OSwxNTUuNjYgMjY5LjA0LDE1MC44NyAyNjUuMDQsMTQ3Ljg0IDI3MC4wNSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjQ5LjQwLDE2NS4wMCA1MS4wNSwxNjkuNzMgNTYuMDYsMTY5Ljg0IDUyLjA2LDE3Mi44NyA1My41MSwxNzcuNjYgNDkuNDAsMTc0LjgwIDQ1LjI5LDE3Ny42NiA0Ni43NCwxNzIuODcgNDIuNzQsMTY5Ljg0IDQ3Ljc1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMTY1LjAwIDEwMC40NSwxNjkuNzMgMTA1LjQ2LDE2OS44NCAxMDEuNDYsMTcyLjg3IDEwMi45MSwxNzcuNjYgOTguODAsMTc0LjgwIDk0LjY5LDE3Ny42NiA5Ni4xNCwxNzIuODcgOTIuMTQsMTY5Ljg0IDk3LjE1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDE2NS4wMCAxNDkuODUsMTY5LjczIDE1NC44NiwxNjkuODQgMTUwLjg2LDE3Mi44NyAxNTIuMzEsMTc3LjY2IDE0OC4yMCwxNzQuODAgMTQ0LjA5LDE3Ny42NiAxNDUuNTQsMTcyLjg3IDE0MS41NCwxNjkuODQgMTQ2LjU1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTk3LjYwLDE2NS4wMCAxOTkuMjUsMTY5LjczIDIwNC4yNiwxNjkuODQgMjAwLjI2LDE3Mi44NyAyMDEuNzEsMTc3LjY2IDE5Ny42MCwxNzQuODAgMTkzLjQ5LDE3Ny42NiAxOTQuOTQsMTcyLjg3IDE5MC45NCwxNjkuODQgMTk1Ljk1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDE2NS4wMCAyNDguNjUsMTY5LjczIDI1My42NiwxNjkuODQgMjQ5LjY2LDE3Mi44NyAyNTEuMTEsMTc3LjY2IDI0Ny4wMCwxNzQuODAgMjQyLjg5LDE3Ny42NiAyNDQuMzQsMTcyLjg3IDI0MC4zNCwxNjkuODQgMjQ1LjM1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsMTg3LjAwIDI2LjM1LDE5MS43MyAzMS4zNiwxOTEuODQgMjcuMzYsMTk0Ljg3IDI4LjgxLDE5OS42NiAyNC43MCwxOTYuODAgMjAuNTksMTk5LjY2IDIyLjA0LDE5NC44NyAxOC4wNCwxOTEuODQgMjMuMDUsMTkxLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxODcuMDAgNzUuNzUsMTkxLjczIDgwLjc2LDE5MS44NCA3Ni43NiwxOTQuODcgNzguMjEsMTk5LjY2IDc0LjEwLDE5Ni44MCA2OS45OSwxOTkuNjYgNzEuNDQsMTk0Ljg3IDY3LjQ0LDE5MS44NCA3Mi40NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCwxODcuMDAgMTI1LjE1LDE5MS43MyAxMzAuMTYsMTkxLjg0IDEyNi4xNiwxOTQuODcgMTI3LjYxLDE5OS42NiAxMjMuNTAsMTk2LjgwIDExOS4zOSwxOTkuNjYgMTIwLjg0LDE5NC44NyAxMTYuODQsMTkxLjg0IDEyMS44NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCwxODcuMDAgMTc0LjU1LDE5MS43MyAxNzkuNTYsMTkxLjg0IDE3NS41NiwxOTQuODcgMTc3LjAxLDE5OS42NiAxNzIuOTAsMTk2LjgwIDE2OC43OSwxOTkuNjYgMTcwLjI0LDE5NC44NyAxNjYuMjQsMTkxLjg0IDE3MS4yNSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxODcuMDAgMjIzLjk1LDE5MS43MyAyMjguOTYsMTkxLjg0IDIyNC45NiwxOTQuODcgMjI2LjQxLDE5OS42NiAyMjIuMzAsMTk2LjgwIDIxOC4xOSwxOTkuNjYgMjE5LjY0LDE5NC44NyAyMTUuNjQsMTkxLjg0IDIyMC42NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCwxODcuMDAgMjczLjM1LDE5MS43MyAyNzguMzYsMTkxLjg0IDI3NC4zNiwxOTQuODcgMjc1LjgxLDE5OS42NiAyNzEuNzAsMTk2LjgwIDI2Ny41OSwxOTkuNjYgMjY5LjA0LDE5NC44NyAyNjUuMDQsMTkxLjg0IDI3MC4wNSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48L3N2Zz4=" alt="United States flag"><button id="us-site-banner-how-toggle" class="us-site-banner-how-toggle" type="button" aria-expanded="false" aria-controls="us-site-banner-how" onclick="toggleOfficialSiteHow()"><span class="us-site-banner-how-label">Here's how you know</span> <span class="us-site-banner-chevron" aria-hidden="true">⌄</span></button><span class="us-site-banner-text">An official website of the United States</span></div><div id="us-site-banner-how" class="us-site-banner-how" aria-hidden="true"><div class="us-site-banner-how-inner"><div class="us-site-banner-lock" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M17 9h-1V7a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9h14v-9a2 2 0 0 0-2-2Zm-7-2a2 2 0 1 1 4 0v2h-4V7Zm3 8.73V18h-2v-2.27a2 2 0 1 1 2 0Z"/></svg></div><div class="us-site-banner-how-copy"><strong>Secure C-8 websites use HTTPS</strong><p>A lock (<span aria-label="lock">🔒</span>) or <span class="https-emphasis">https://</span> means you've safely connected to the C-8 website. Share sensitive information only on official, secure websites.</p></div></div></div></div>
   <div class="topbar"></div>
   <div class="c8-no-screenshots" role="note">SENSITIVE · NO SCREENSHOTS</div>
+  <canvas id="c8-capture-watermark" class="c8-capture-watermark" aria-hidden="true"></canvas>
   <section id="loading" class="loading-screen hidden"><div class="loading-card"><div class="seal"><img src="/c8-brand-logo-v1.png?v=c8-brand-v1" alt="C-8 Federal logo"></div><h1>Integrated Operations Console</h1><p>Initializing secure console services.</p><div class="progress-track"><div class="progress-bar"></div></div><div class="small-caps">Controlled Unclassified Environment</div></div></section>
   <section id="app" class="app-shell"><header><div class="header-inner"><div class="brand"><div class="mini-seal"><img src="/c8-brand-logo-v1.png?v=c8-brand-v1" alt="C-8 Federal logo"></div><div><div class="agency">C-8 Federal</div><div class="subagency">Integrated Operations Console</div></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><a class="version-pill" href="/shop/" style="text-decoration:none;font-weight:800">Shop</a><a class="version-pill" href="mailto:C8-Console-Support@proton.me" style="text-decoration:none;font-weight:800">Support</a><div class="version-pill" id="clock">UTC</div></div></div></header><main class="dashboard"><nav class="side-panel"><div class="side-title"><span>Console Menu</span></div><div id="nav"></div><div class="footer-note">Bound to <span class="kbd">__BIND_LABEL__</span>. Tools run only after database login unless explicitly configured otherwise.</div></nav><section class="dashboard-panel"><div class="panel-heading"><h2 id="module-title">Overview</h2><div class="muted" id="module-subtitle">Ready</div></div><div class="panel-body" id="content"></div></section></main></section>
 <footer class="site-footer" aria-label="Site information"><span class="site-footer-ip">104.248.233.71</span><span class="site-footer-agency">An official website of the U.S. C-8 Administration</span></footer>
@@ -32848,15 +32853,48 @@ const C8_TRUSTED_TYPES_POLICY = (()=>{
   }
 })();
 const MODULES = ["Overview","IP Forensics","Connectivity Assessment","IP Database","OSINT","Email Forensics","File Forensics","Sub-Dominator","Website Copier","Site Forensics","ICMP Probe","Profiler","Shredder","Meta View/Wipe","Stegano","De/Encrypter","Black Cloud","Dome","Settings"];
-const state = { current: "Overview", theme: "dark", csrf: null, authenticated: false, role: "operator", isAdmin: false, username: "", userId: null, privacyBlur: false };
+const state = { current: "Overview", theme: "dark", csrf: null, authenticated: false, role: "operator", isAdmin: false, username: "", userId: null, viewerIp: "", privacyBlur: false };
 const C8_BOOTSTRAP_SESSION = __C8_BOOTSTRAP_SESSION__;
 function $(id){ return document.getElementById(id); }
+// Repeated, viewer-specific markings remain visible in normal screenshots and recordings.
+function c8WatermarkSync(){
+  const canvas=$('c8-capture-watermark');
+  if(!canvas)return;
+  const active=Boolean(state.authenticated);
+  canvas.classList.toggle('active',active);
+  if(!active)return;
+  const width=Math.max(1,Number(window.innerWidth)||1024),height=Math.max(1,Number(window.innerHeight)||768);
+  const ratio=Math.max(1,Math.min(1.5,Number(window.devicePixelRatio)||1));
+  canvas.width=Math.min(3840,Math.round(width*ratio));
+  canvas.height=Math.min(2160,Math.round(height*ratio));
+  const ctx=canvas.getContext('2d');
+  if(!ctx)return;
+  ctx.setTransform(canvas.width/width,0,0,canvas.height/height,0,0);
+  ctx.clearRect(0,0,width,height);
+  const privateView=state.isAdmin&&state.privacyBlur;
+  const name=privateView?'ADMIN SESSION':String(state.username||'account').slice(0,34);
+  const address=privateView?'':String(state.viewerIp||C8_BOOTSTRAP_SESSION?.viewer_ip||'').slice(0,48);
+  const area=String(state.current||'Console').slice(0,26);
+  const stamp=new Date().toISOString().slice(0,16).replace('T',' ')+' UTC';
+  ctx.fillStyle=document.body.classList.contains('theme-dark')?'#f4f7ff':'#071a33';
+  ctx.textAlign='center';
+  for(let y=-140;y<height+200;y+=175){
+    for(let x=-180;x<width+280;x+=355){
+      ctx.save();ctx.translate(x,y);ctx.rotate(-0.26);
+      ctx.font='bold 15px Arial,sans-serif';ctx.fillText('C-8 · '+name+' · '+area,0,0,330);
+      ctx.font='bold 12px Arial,sans-serif';ctx.fillText((address?address+' · ':'')+stamp,0,22,330);
+      ctx.restore();
+    }
+  }
+}
+window.addEventListener('resize',()=>{if(state.authenticated)c8WatermarkSync();});
+setInterval(()=>{if(state.authenticated)c8WatermarkSync();},30000);
 // A best-effort visual veil. Browser code cannot stop operating-system capture.
 let c8CaptureWindowFocused=true;
 let c8CaptureHoldUntil=0;
 let c8CaptureHoldTimer=null;
 let c8CaptureShortcutHeld=false;
-const c8CaptureLastReport={ctrl_shift:0,print_screen:0};
+const c8CaptureLastReport={ctrl_shift:0,print_screen:0,system_snip:0,mac_capture:0,print_dialog:0};
 function c8CaptureVeilSync(){
   const hold=Math.max(0,c8CaptureHoldUntil-Date.now());
   document.body.classList.toggle('c8-capture-veil',document.visibilityState==='hidden'||!c8CaptureWindowFocused||c8CaptureShortcutHeld||hold>0);
@@ -32880,11 +32918,27 @@ document.addEventListener('visibilitychange',()=>{
   c8CaptureVeilSync();
 });
 document.addEventListener('keydown',event=>{
+  const key=String(event.key||'').toLowerCase();
   if(event.key==='PrintScreen'||event.code==='PrintScreen'){
     event.preventDefault();
     c8CaptureHoldUntil=Date.now()+2000;
     c8CaptureVeilSync();
     if(!event.repeat)c8CaptureReport('print_screen');
+  }else if((event.ctrlKey||event.metaKey)&&!event.altKey&&key==='p'){
+    event.preventDefault();
+    c8CaptureHoldUntil=Date.now()+4000;
+    c8CaptureVeilSync();
+    c8CaptureReport('print_dialog');
+  }else if(event.metaKey&&event.shiftKey&&!event.ctrlKey&&!event.altKey&&key==='s'){
+    event.preventDefault();
+    c8CaptureHoldUntil=Date.now()+3000;
+    c8CaptureVeilSync();
+    c8CaptureReport('system_snip');
+  }else if(event.metaKey&&event.shiftKey&&!event.ctrlKey&&!event.altKey&&['3','4','5'].includes(key)){
+    event.preventDefault();
+    c8CaptureHoldUntil=Date.now()+3000;
+    c8CaptureVeilSync();
+    c8CaptureReport('mac_capture');
   }else if(event.ctrlKey&&event.shiftKey&&!event.altKey&&!event.metaKey){
     event.preventDefault();
     const first=!c8CaptureShortcutHeld;
@@ -32894,6 +32948,12 @@ document.addEventListener('keydown',event=>{
     if(first)c8CaptureReport('ctrl_shift');
   }
 },true);
+window.addEventListener('beforeprint',()=>{
+  c8CaptureHoldUntil=Date.now()+4000;
+  c8CaptureVeilSync();
+  c8CaptureReport('print_dialog');
+});
+window.addEventListener('afterprint',()=>{c8CaptureHoldUntil=Date.now()+1500;c8CaptureVeilSync();});
 document.addEventListener('keyup',event=>{
   if(c8CaptureShortcutHeld&&!(event.ctrlKey&&event.shiftKey)){
     c8CaptureShortcutHeld=false;
@@ -33017,6 +33077,7 @@ function applyTheme(theme){
   const label = $('theme-current'); if(label) label.textContent = t.toUpperCase();
   document.querySelectorAll('[data-theme-card]').forEach(el => el.classList.toggle('active', el.dataset.themeCard === t));
   const select = $('theme-select'); if(select) select.value = t;
+  if(state.authenticated)c8WatermarkSync();
 }
 function setTheme(theme){ applyTheme(theme); auditClientEvent('theme_change',{theme:String(theme||'')}); }
 // Admin display privacy. Mask titles so hovering does not bypass blur.
@@ -33132,6 +33193,7 @@ function setPrivacyMode(mode,enabled){
     window.sessionStorage.setItem('c8-admin-privacy-blur',state.privacyBlur?'1':'0');
   }catch(_e){}
   c8PrivacyApply();
+  c8WatermarkSync();
 }
 document.addEventListener('click',event=>{
   if(!c8PrivacyEnabled()||!event.target.closest)return;
@@ -33276,6 +33338,7 @@ function applySessionRole(data){
   state.isAdmin = role === 'admin' || (data||{}).is_admin === true;
   state.username = String((data||{}).username || '');
   state.userId = (data||{}).user_id ?? null;
+  state.viewerIp = String((data||{}).viewer_ip || state.viewerIp || C8_BOOTSTRAP_SESSION?.viewer_ip || '').slice(0,64);
 }
 function showApp(){
   c8BootComplete = true;
@@ -37905,7 +37968,8 @@ function adminSecurityPaint(){
   const q=String(($('admin-security-search')||{}).value||'').trim().toLowerCase();
   const events=(adminSecurityCache.events||[]).filter(e=>!q||pretty(e).toLowerCase().includes(q));
   const captureReports=(adminSecurityCache.capture_shortcut_events||[]).filter(e=>!q||pretty(e).toLowerCase().includes(q));
-  const captureRows=captureReports.length?captureReports.map(e=>`<tr><td>${esc(e.created_at||'N/A')}</td><td>${securityCode(e.username||'Anonymous (not signed in)','user')}</td><td>${securityCode(e.remote_ip||'N/A','ip')}</td><td>${securityCode(e.page_path||'N/A','request')}</td><td>${securityCode(e.module||'N/A','subject')}</td><td>${securityChip(e.shortcut==='print_screen'?'Print Screen':'Ctrl + Shift','medium')}</td><td>${securityChip(e.integrity?.status||'N/A',e.integrity?.status==='verified'?'ok':'medium')}</td></tr>`).join(''):'<tr><td colspan="7">No browser-reported screenshot shortcuts match.</td></tr>';
+  const captureLabels={ctrl_shift:'Ctrl + Shift',print_screen:'Print Screen',system_snip:'Meta + Shift + S',mac_capture:'Command + Shift + 3/4/5',print_dialog:'Print / Save as PDF'};
+  const captureRows=captureReports.length?captureReports.map(e=>`<tr><td>${esc(e.created_at||'N/A')}</td><td>${securityCode(e.username||'Anonymous (not signed in)','user')}</td><td>${securityCode(e.remote_ip||'N/A','ip')}</td><td>${securityCode(e.page_path||'N/A','request')}</td><td>${securityCode(e.module||'N/A','subject')}</td><td>${securityChip(captureLabels[e.shortcut]||'Other shortcut','medium')}</td><td>${securityChip(e.integrity?.status||'N/A',e.integrity?.status==='verified'?'ok':'medium')}</td></tr>`).join(''):'<tr><td colspan="7">No browser-reported capture or print shortcuts match.</td></tr>';
   const guards=(adminSecurityCache.guards||[]).filter(g=>!q||pretty(g).toLowerCase().includes(q));
   const guardIPs=[...new Set(guards.map(adminSecurityGuardIP).filter(Boolean))];
   const floodGuards=[...(adminSecurityCache.request_guards||[]),...(adminSecurityCache.network_guards||[])].filter(g=>!q||pretty(g).toLowerCase().includes(q));
@@ -37937,7 +38001,7 @@ function adminSecurityPaint(){
   const integrityNote=(integrityLost?`<p class="tiny bad">${integrityLost} sampled older signatures are unverifiable because their signing key was lost. The rows and old signatures remain unchanged; new rows use the persistent replacement key.</p>`:'')+(integrityMismatch?`<p class="tiny bad">${integrityMismatch} sampled records show an integrity mismatch or unknown algorithm. Investigate with --audit-integrity-check; no mismatched records were re-signed.</p>`:'');
   const integrityRows=Object.keys(integrityTables).length?Object.entries(integrityTables).map(([name,row])=>{const mismatch=Number(row.mismatch||0)+Number(row.unknown_algorithm||0);const legacy=Number(row.legacy_unsigned||0);const lost=Number(row.unverifiable_lost_key||0);const status=row.columns_present?(mismatch?securityChip('Mismatch','critical'):(lost?securityChip('Lost key','medium'):(legacy?securityChip('Mixed','medium'):securityChip('Verified','ok')))):securityChip('No columns','medium');return `<tr><td>${securityCode(name,'subject')}</td><td>${status}</td><td>${esc(row.verified??0)}</td><td>${esc(row.verified_previous_key??0)}</td><td>${esc(row.verified_legacy_numeric??0)}</td><td>${securityCount(row.mismatch??0,1,1)}</td><td>${lost?securityChip(String(lost),'medium'):esc(0)}</td><td>${legacy?securityChip(String(legacy),'medium'):esc(0)}</td><td>${esc(row.sampled??0)}</td></tr>`;}).join(''):'<tr><td colspan="9">No integrity sample available.</td></tr>';
   root.innerHTML=`<div class="card"><h3>Request flood guards</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Scope</th><th>Client / network</th><th>Strikes</th><th>Window</th><th>Burst</th><th>Body bytes</th><th>Block remaining</th><th>Signals</th><th>Last seen</th></tr></thead><tbody>${floodRows}</tbody></table></div></div><div class="card"><h3>Login guards</h3><p class="tiny muted">Ban only IP subjects. Account and combined guards do not contain an IP address.</p><div class="actions" style="margin:0 0 12px"><button class="secondary-btn" type="button" onclick="adminSecurityBanGuardIPs()" ${guardIPs.length?'':'disabled'}>Ban ${guardIPs.length} displayed guard IP${guardIPs.length===1?'':'s'}</button></div><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Guard</th><th>Subject</th><th>Failures</th><th>Distinct sources/targets</th><th>Block remaining</th><th>Reason</th><th>Updated</th><th>Action</th></tr></thead><tbody>${guardRows}</tbody></table></div></div><div class="card"><h3>Persistent VPS IP bans</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>IP / CIDR</th><th>Reason</th><th>Created</th><th>Expires</th><th>Source</th><th>Action</th></tr></thead><tbody>${banRows}</tbody></table></div><p class="tiny ${adminSecurityCache.persistent_ip_ban_state_ok?'ok':'bad'}">State: ${adminSecurityCache.persistent_ip_ban_state_ok?'encrypted and loaded':'last valid rules retained; '+esc(adminSecurityCache.persistent_ip_ban_load_error||'state error')}</p><p class="tiny ${ipFirewall.active&&ipFirewall.ok?'ok':'bad'}">${ipFirewallMessage}</p></div><div class="card"><h3>VPS ban audit trail</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Action</th><th>IP / CIDR</th><th>Reason</th><th>Operator</th><th>Server</th></tr></thead><tbody>${banHistoryRows}</tbody></table></div></div><div class="card"><h3>Audit integrity</h3>${integrityNote}<div class="table-panel" style="overflow:auto"><table><thead><tr><th>Table</th><th>Status</th><th>Verified</th><th>Prior key</th><th>Legacy numeric</th><th>Mismatch</th><th>Lost key</th><th>Legacy unsigned</th><th>Sampled</th></tr></thead><tbody>${integrityRows}</tbody></table></div></div><div class="card"><h3>Security events</h3><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time</th><th>Severity</th><th>Event</th><th>IP</th><th>Username</th><th>Request</th><th>Signals</th><th>Details</th></tr></thead><tbody>${eventRows}</tbody></table></div></div>`;
-  root.insertAdjacentHTML('afterbegin',`<div class="card"><h3>Possible screenshot shortcut reports (${captureReports.length})</h3><p class="tiny muted">Browser-reported keys are not proof that a screenshot was taken. Page and area are browser-reported; account, IP, and time come from the server. Reports are limited to the 250 most recent records.</p><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time (UTC)</th><th>Account</th><th>Source IP</th><th>Page</th><th>Area</th><th>Keys detected</th><th>Audit integrity</th></tr></thead><tbody>${captureRows}</tbody></table></div></div>`);
+  root.insertAdjacentHTML('afterbegin',`<div class="card"><h3>Possible capture and print reports (${captureReports.length})</h3><p class="tiny muted">Browser-reported shortcuts are not proof that a screenshot was taken. Page and area are browser-reported; account, IP, and time come from the server. Reports are limited to the 250 most recent records.</p><div class="table-panel" style="overflow:auto"><table><thead><tr><th>Time (UTC)</th><th>Account</th><th>Source IP</th><th>Page</th><th>Area</th><th>Keys detected</th><th>Audit integrity</th></tr></thead><tbody>${captureRows}</tbody></table></div></div>`);
 }
 let adminBanRequestBusy=false;
 async function adminSecurityBanGuardIP(ip){
@@ -38168,6 +38232,7 @@ function showModule(name){
   $('content').innerHTML = fn();
   applyAdminOnlyUi();
   c8PrivacyApply();
+  if(state.authenticated)c8WatermarkSync();
   if(name==='Connectivity Assessment'){ connectivityLoad(); }
   if(name==='IP Database'){ ipdbLoad(); }
   if(name==='ICMP Probe'){ icmpProfileChanged(); icmpRenderTable(); }
@@ -38197,6 +38262,8 @@ function showLogin(message){
   state.isAdmin = false;
   state.username = '';
   state.userId = null;
+  state.viewerIp = '';
+  c8WatermarkSync();
   c8PrivacyClear();
   c8PrivacyApply();
   try{ window.location.replace('/'); }catch(e){ window.location.href='/'; }
@@ -40051,12 +40118,14 @@ LOGIN_PAGE_HTML = r'''<!doctype html>
       .notice, .gateway { padding: 21px; }
     }
     .c8-no-screenshots{position:fixed;z-index:10000;right:10px;bottom:10px;padding:6px 10px;border:2px solid #fff;background:#8a1f1f;color:#fff;font:800 .74rem/1.25 Arial,sans-serif;pointer-events:none}
+    .c8-capture-watermark{position:fixed;inset:0;width:100%;height:100%;z-index:9990;pointer-events:none;opacity:.14}
     body.c8-capture-veil::after{content:"SENSITIVE CONTENT HIDDEN WHILE THE WINDOW IS INACTIVE";position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:24px;text-align:center;background:#071a33;color:#fff;font:800 clamp(1rem,3vw,1.5rem)/1.4 Arial,sans-serif;letter-spacing:.06em;pointer-events:none}
     @media print{body > *{display:none!important}body::before{content:"SENSITIVE — Printing this page is disabled.";display:block!important;padding:24px;font:18pt Arial,sans-serif;color:#000;background:#fff}body::after{display:none!important}}
   </style>
 </head>
 <body>
   <div class="c8-no-screenshots" role="note">SENSITIVE · NO SCREENSHOTS</div>
+  <canvas id="c8-capture-watermark" class="c8-capture-watermark" aria-hidden="true"></canvas>
   <div class="official-banner" role="note" aria-label="Official website notice">
     <div class="official-banner-inner"><img class="official-site-flag" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA3NDEgMzkwIiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlVuaXRlZCBTdGF0ZXMgZmxhZyI+PHJlY3QgeD0iMCIgeT0iMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjMwIiB3aWR0aD0iNzQxIiBoZWlnaHQ9IjMwIiBmaWxsPSIjRkZGRkZGIi8+PHJlY3QgeD0iMCIgeT0iNjAiIHdpZHRoPSI3NDEiIGhlaWdodD0iMzAiIGZpbGw9IiNCMzE5NDIiLz48cmVjdCB4PSIwIiB5PSI5MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjEyMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjE1MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjE4MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjIxMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjI0MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjI3MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjMwMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjMzMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjM2MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjAiIHdpZHRoPSIyOTYuNCIgaGVpZ2h0PSIyMTAiIGZpbGw9IiMwQTMxNjEiLz48cG9seWdvbiBwb2ludHM9IjI0LjcwLDExLjAwIDI2LjM1LDE1LjczIDMxLjM2LDE1Ljg0IDI3LjM2LDE4Ljg3IDI4LjgxLDIzLjY2IDI0LjcwLDIwLjgwIDIwLjU5LDIzLjY2IDIyLjA0LDE4Ljg3IDE4LjA0LDE1Ljg0IDIzLjA1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxMS4wMCA3NS43NSwxNS43MyA4MC43NiwxNS44NCA3Ni43NiwxOC44NyA3OC4yMSwyMy42NiA3NC4xMCwyMC44MCA2OS45OSwyMy42NiA3MS40NCwxOC44NyA2Ny40NCwxNS44NCA3Mi40NSwxNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTIzLjUwLDExLjAwIDEyNS4xNSwxNS43MyAxMzAuMTYsMTUuODQgMTI2LjE2LDE4Ljg3IDEyNy42MSwyMy42NiAxMjMuNTAsMjAuODAgMTE5LjM5LDIzLjY2IDEyMC44NCwxOC44NyAxMTYuODQsMTUuODQgMTIxLjg1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxNzIuOTAsMTEuMDAgMTc0LjU1LDE1LjczIDE3OS41NiwxNS44NCAxNzUuNTYsMTguODcgMTc3LjAxLDIzLjY2IDE3Mi45MCwyMC44MCAxNjguNzksMjMuNjYgMTcwLjI0LDE4Ljg3IDE2Ni4yNCwxNS44NCAxNzEuMjUsMTUuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxMS4wMCAyMjMuOTUsMTUuNzMgMjI4Ljk2LDE1Ljg0IDIyNC45NiwxOC44NyAyMjYuNDEsMjMuNjYgMjIyLjMwLDIwLjgwIDIxOC4xOSwyMy42NiAyMTkuNjQsMTguODcgMjE1LjY0LDE1Ljg0IDIyMC42NSwxNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjcxLjcwLDExLjAwIDI3My4zNSwxNS43MyAyNzguMzYsMTUuODQgMjc0LjM2LDE4Ljg3IDI3NS44MSwyMy42NiAyNzEuNzAsMjAuODAgMjY3LjU5LDIzLjY2IDI2OS4wNCwxOC44NyAyNjUuMDQsMTUuODQgMjcwLjA1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI0OS40MCwzMy4wMCA1MS4wNSwzNy43MyA1Ni4wNiwzNy44NCA1Mi4wNiw0MC44NyA1My41MSw0NS42NiA0OS40MCw0Mi44MCA0NS4yOSw0NS42NiA0Ni43NCw0MC44NyA0Mi43NCwzNy44NCA0Ny43NSwzNy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMzMuMDAgMTAwLjQ1LDM3LjczIDEwNS40NiwzNy44NCAxMDEuNDYsNDAuODcgMTAyLjkxLDQ1LjY2IDk4LjgwLDQyLjgwIDk0LjY5LDQ1LjY2IDk2LjE0LDQwLjg3IDkyLjE0LDM3Ljg0IDk3LjE1LDM3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxNDguMjAsMzMuMDAgMTQ5Ljg1LDM3LjczIDE1NC44NiwzNy44NCAxNTAuODYsNDAuODcgMTUyLjMxLDQ1LjY2IDE0OC4yMCw0Mi44MCAxNDQuMDksNDUuNjYgMTQ1LjU0LDQwLjg3IDE0MS41NCwzNy44NCAxNDYuNTUsMzcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE5Ny42MCwzMy4wMCAxOTkuMjUsMzcuNzMgMjA0LjI2LDM3Ljg0IDIwMC4yNiw0MC44NyAyMDEuNzEsNDUuNjYgMTk3LjYwLDQyLjgwIDE5My40OSw0NS42NiAxOTQuOTQsNDAuODcgMTkwLjk0LDM3Ljg0IDE5NS45NSwzNy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDMzLjAwIDI0OC42NSwzNy43MyAyNTMuNjYsMzcuODQgMjQ5LjY2LDQwLjg3IDI1MS4xMSw0NS42NiAyNDcuMDAsNDIuODAgMjQyLjg5LDQ1LjY2IDI0NC4zNCw0MC44NyAyNDAuMzQsMzcuODQgMjQ1LjM1LDM3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyNC43MCw1NS4wMCAyNi4zNSw1OS43MyAzMS4zNiw1OS44NCAyNy4zNiw2Mi44NyAyOC44MSw2Ny42NiAyNC43MCw2NC44MCAyMC41OSw2Ny42NiAyMi4wNCw2Mi44NyAxOC4wNCw1OS44NCAyMy4wNSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iNzQuMTAsNTUuMDAgNzUuNzUsNTkuNzMgODAuNzYsNTkuODQgNzYuNzYsNjIuODcgNzguMjEsNjcuNjYgNzQuMTAsNjQuODAgNjkuOTksNjcuNjYgNzEuNDQsNjIuODcgNjcuNDQsNTkuODQgNzIuNDUsNTkuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCw1NS4wMCAxMjUuMTUsNTkuNzMgMTMwLjE2LDU5Ljg0IDEyNi4xNiw2Mi44NyAxMjcuNjEsNjcuNjYgMTIzLjUwLDY0LjgwIDExOS4zOSw2Ny42NiAxMjAuODQsNjIuODcgMTE2Ljg0LDU5Ljg0IDEyMS44NSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTcyLjkwLDU1LjAwIDE3NC41NSw1OS43MyAxNzkuNTYsNTkuODQgMTc1LjU2LDYyLjg3IDE3Ny4wMSw2Ny42NiAxNzIuOTAsNjQuODAgMTY4Ljc5LDY3LjY2IDE3MC4yNCw2Mi44NyAxNjYuMjQsNTkuODQgMTcxLjI1LDU5LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyMjIuMzAsNTUuMDAgMjIzLjk1LDU5LjczIDIyOC45Niw1OS44NCAyMjQuOTYsNjIuODcgMjI2LjQxLDY3LjY2IDIyMi4zMCw2NC44MCAyMTguMTksNjcuNjYgMjE5LjY0LDYyLjg3IDIxNS42NCw1OS44NCAyMjAuNjUsNTkuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCw1NS4wMCAyNzMuMzUsNTkuNzMgMjc4LjM2LDU5Ljg0IDI3NC4zNiw2Mi44NyAyNzUuODEsNjcuNjYgMjcxLjcwLDY0LjgwIDI2Ny41OSw2Ny42NiAyNjkuMDQsNjIuODcgMjY1LjA0LDU5Ljg0IDI3MC4wNSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iNDkuNDAsNzcuMDAgNTEuMDUsODEuNzMgNTYuMDYsODEuODQgNTIuMDYsODQuODcgNTMuNTEsODkuNjYgNDkuNDAsODYuODAgNDUuMjksODkuNjYgNDYuNzQsODQuODcgNDIuNzQsODEuODQgNDcuNzUsODEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9Ijk4LjgwLDc3LjAwIDEwMC40NSw4MS43MyAxMDUuNDYsODEuODQgMTAxLjQ2LDg0Ljg3IDEwMi45MSw4OS42NiA5OC44MCw4Ni44MCA5NC42OSw4OS42NiA5Ni4xNCw4NC44NyA5Mi4xNCw4MS44NCA5Ny4xNSw4MS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDc3LjAwIDE0OS44NSw4MS43MyAxNTQuODYsODEuODQgMTUwLjg2LDg0Ljg3IDE1Mi4zMSw4OS42NiAxNDguMjAsODYuODAgMTQ0LjA5LDg5LjY2IDE0NS41NCw4NC44NyAxNDEuNTQsODEuODQgMTQ2LjU1LDgxLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxOTcuNjAsNzcuMDAgMTk5LjI1LDgxLjczIDIwNC4yNiw4MS44NCAyMDAuMjYsODQuODcgMjAxLjcxLDg5LjY2IDE5Ny42MCw4Ni44MCAxOTMuNDksODkuNjYgMTk0Ljk0LDg0Ljg3IDE5MC45NCw4MS44NCAxOTUuOTUsODEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI0Ny4wMCw3Ny4wMCAyNDguNjUsODEuNzMgMjUzLjY2LDgxLjg0IDI0OS42Niw4NC44NyAyNTEuMTEsODkuNjYgMjQ3LjAwLDg2LjgwIDI0Mi44OSw4OS42NiAyNDQuMzQsODQuODcgMjQwLjM0LDgxLjg0IDI0NS4zNSw4MS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsOTkuMDAgMjYuMzUsMTAzLjczIDMxLjM2LDEwMy44NCAyNy4zNiwxMDYuODcgMjguODEsMTExLjY2IDI0LjcwLDEwOC44MCAyMC41OSwxMTEuNjYgMjIuMDQsMTA2Ljg3IDE4LjA0LDEwMy44NCAyMy4wNSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9Ijc0LjEwLDk5LjAwIDc1Ljc1LDEwMy43MyA4MC43NiwxMDMuODQgNzYuNzYsMTA2Ljg3IDc4LjIxLDExMS42NiA3NC4xMCwxMDguODAgNjkuOTksMTExLjY2IDcxLjQ0LDEwNi44NyA2Ny40NCwxMDMuODQgNzIuNDUsMTAzLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxMjMuNTAsOTkuMDAgMTI1LjE1LDEwMy43MyAxMzAuMTYsMTAzLjg0IDEyNi4xNiwxMDYuODcgMTI3LjYxLDExMS42NiAxMjMuNTAsMTA4LjgwIDExOS4zOSwxMTEuNjYgMTIwLjg0LDEwNi44NyAxMTYuODQsMTAzLjg0IDEyMS44NSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCw5OS4wMCAxNzQuNTUsMTAzLjczIDE3OS41NiwxMDMuODQgMTc1LjU2LDEwNi44NyAxNzcuMDEsMTExLjY2IDE3Mi45MCwxMDguODAgMTY4Ljc5LDExMS42NiAxNzAuMjQsMTA2Ljg3IDE2Ni4yNCwxMDMuODQgMTcxLjI1LDEwMy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjIyLjMwLDk5LjAwIDIyMy45NSwxMDMuNzMgMjI4Ljk2LDEwMy44NCAyMjQuOTYsMTA2Ljg3IDIyNi40MSwxMTEuNjYgMjIyLjMwLDEwOC44MCAyMTguMTksMTExLjY2IDIxOS42NCwxMDYuODcgMjE1LjY0LDEwMy44NCAyMjAuNjUsMTAzLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyNzEuNzAsOTkuMDAgMjczLjM1LDEwMy43MyAyNzguMzYsMTAzLjg0IDI3NC4zNiwxMDYuODcgMjc1LjgxLDExMS42NiAyNzEuNzAsMTA4LjgwIDI2Ny41OSwxMTEuNjYgMjY5LjA0LDEwNi44NyAyNjUuMDQsMTAzLjg0IDI3MC4wNSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjQ5LjQwLDEyMS4wMCA1MS4wNSwxMjUuNzMgNTYuMDYsMTI1Ljg0IDUyLjA2LDEyOC44NyA1My41MSwxMzMuNjYgNDkuNDAsMTMwLjgwIDQ1LjI5LDEzMy42NiA0Ni43NCwxMjguODcgNDIuNzQsMTI1Ljg0IDQ3Ljc1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMTIxLjAwIDEwMC40NSwxMjUuNzMgMTA1LjQ2LDEyNS44NCAxMDEuNDYsMTI4Ljg3IDEwMi45MSwxMzMuNjYgOTguODAsMTMwLjgwIDk0LjY5LDEzMy42NiA5Ni4xNCwxMjguODcgOTIuMTQsMTI1Ljg0IDk3LjE1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDEyMS4wMCAxNDkuODUsMTI1LjczIDE1NC44NiwxMjUuODQgMTUwLjg2LDEyOC44NyAxNTIuMzEsMTMzLjY2IDE0OC4yMCwxMzAuODAgMTQ0LjA5LDEzMy42NiAxNDUuNTQsMTI4Ljg3IDE0MS41NCwxMjUuODQgMTQ2LjU1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTk3LjYwLDEyMS4wMCAxOTkuMjUsMTI1LjczIDIwNC4yNiwxMjUuODQgMjAwLjI2LDEyOC44NyAyMDEuNzEsMTMzLjY2IDE5Ny42MCwxMzAuODAgMTkzLjQ5LDEzMy42NiAxOTQuOTQsMTI4Ljg3IDE5MC45NCwxMjUuODQgMTk1Ljk1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDEyMS4wMCAyNDguNjUsMTI1LjczIDI1My42NiwxMjUuODQgMjQ5LjY2LDEyOC44NyAyNTEuMTEsMTMzLjY2IDI0Ny4wMCwxMzAuODAgMjQyLjg5LDEzMy42NiAyNDQuMzQsMTI4Ljg3IDI0MC4zNCwxMjUuODQgMjQ1LjM1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsMTQzLjAwIDI2LjM1LDE0Ny43MyAzMS4zNiwxNDcuODQgMjcuMzYsMTUwLjg3IDI4LjgxLDE1NS42NiAyNC43MCwxNTIuODAgMjAuNTksMTU1LjY2IDIyLjA0LDE1MC44NyAxOC4wNCwxNDcuODQgMjMuMDUsMTQ3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxNDMuMDAgNzUuNzUsMTQ3LjczIDgwLjc2LDE0Ny44NCA3Ni43NiwxNTAuODcgNzguMjEsMTU1LjY2IDc0LjEwLDE1Mi44MCA2OS45OSwxNTUuNjYgNzEuNDQsMTUwLjg3IDY3LjQ0LDE0Ny44NCA3Mi40NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCwxNDMuMDAgMTI1LjE1LDE0Ny43MyAxMzAuMTYsMTQ3Ljg0IDEyNi4xNiwxNTAuODcgMTI3LjYxLDE1NS42NiAxMjMuNTAsMTUyLjgwIDExOS4zOSwxNTUuNjYgMTIwLjg0LDE1MC44NyAxMTYuODQsMTQ3Ljg0IDEyMS44NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCwxNDMuMDAgMTc0LjU1LDE0Ny43MyAxNzkuNTYsMTQ3Ljg0IDE3NS41NiwxNTAuODcgMTc3LjAxLDE1NS42NiAxNzIuOTAsMTUyLjgwIDE2OC43OSwxNTUuNjYgMTcwLjI0LDE1MC44NyAxNjYuMjQsMTQ3Ljg0IDE3MS4yNSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxNDMuMDAgMjIzLjk1LDE0Ny43MyAyMjguOTYsMTQ3Ljg0IDIyNC45NiwxNTAuODcgMjI2LjQxLDE1NS42NiAyMjIuMzAsMTUyLjgwIDIxOC4xOSwxNTUuNjYgMjE5LjY0LDE1MC44NyAyMTUuNjQsMTQ3Ljg0IDIyMC42NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCwxNDMuMDAgMjczLjM1LDE0Ny43MyAyNzguMzYsMTQ3Ljg0IDI3NC4zNiwxNTAuODcgMjc1LjgxLDE1NS42NiAyNzEuNzAsMTUyLjgwIDI2Ny41OSwxNTUuNjYgMjY5LjA0LDE1MC44NyAyNjUuMDQsMTQ3Ljg0IDI3MC4wNSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjQ5LjQwLDE2NS4wMCA1MS4wNSwxNjkuNzMgNTYuMDYsMTY5Ljg0IDUyLjA2LDE3Mi44NyA1My41MSwxNzcuNjYgNDkuNDAsMTc0LjgwIDQ1LjI5LDE3Ny42NiA0Ni43NCwxNzIuODcgNDIuNzQsMTY5Ljg0IDQ3Ljc1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMTY1LjAwIDEwMC40NSwxNjkuNzMgMTA1LjQ2LDE2OS44NCAxMDEuNDYsMTcyLjg3IDEwMi45MSwxNzcuNjYgOTguODAsMTc0LjgwIDk0LjY5LDE3Ny42NiA5Ni4xNCwxNzIuODcgOTIuMTQsMTY5Ljg0IDk3LjE1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDE2NS4wMCAxNDkuODUsMTY5LjczIDE1NC44NiwxNjkuODQgMTUwLjg2LDE3Mi44NyAxNTIuMzEsMTc3LjY2IDE0OC4yMCwxNzQuODAgMTQ0LjA5LDE3Ny42NiAxNDUuNTQsMTcyLjg3IDE0MS41NCwxNjkuODQgMTQ2LjU1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTk3LjYwLDE2NS4wMCAxOTkuMjUsMTY5LjczIDIwNC4yNiwxNjkuODQgMjAwLjI2LDE3Mi44NyAyMDEuNzEsMTc3LjY2IDE5Ny42MCwxNzQuODAgMTkzLjQ5LDE3Ny42NiAxOTQuOTQsMTcyLjg3IDE5MC45NCwxNjkuODQgMTk1Ljk1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDE2NS4wMCAyNDguNjUsMTY5LjczIDI1My42NiwxNjkuODQgMjQ5LjY2LDE3Mi44NyAyNTEuMTEsMTc3LjY2IDI0Ny4wMCwxNzQuODAgMjQyLjg5LDE3Ny42NiAyNDQuMzQsMTcyLjg3IDI0MC4zNCwxNjkuODQgMjQ1LjM1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsMTg3LjAwIDI2LjM1LDE5MS43MyAzMS4zNiwxOTEuODQgMjcuMzYsMTk0Ljg3IDI4LjgxLDE5OS42NiAyNC43MCwxOTYuODAgMjAuNTksMTk5LjY2IDIyLjA0LDE5NC44NyAxOC4wNCwxOTEuODQgMjMuMDUsMTkxLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxODcuMDAgNzUuNzUsMTkxLjczIDgwLjc2LDE5MS44NCA3Ni43NiwxOTQuODcgNzguMjEsMTk5LjY2IDc0LjEwLDE5Ni44MCA2OS45OSwxOTkuNjYgNzEuNDQsMTk0Ljg3IDY3LjQ0LDE5MS44NCA3Mi40NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCwxODcuMDAgMTI1LjE1LDE5MS43MyAxMzAuMTYsMTkxLjg0IDEyNi4xNiwxOTQuODcgMTI3LjYxLDE5OS42NiAxMjMuNTAsMTk2LjgwIDExOS4zOSwxOTkuNjYgMTIwLjg0LDE5NC44NyAxMTYuODQsMTkxLjg0IDEyMS44NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCwxODcuMDAgMTc0LjU1LDE5MS43MyAxNzkuNTYsMTkxLjg0IDE3NS41NiwxOTQuODcgMTc3LjAxLDE5OS42NiAxNzIuOTAsMTk2LjgwIDE2OC43OSwxOTkuNjYgMTcwLjI0LDE5NC44NyAxNjYuMjQsMTkxLjg0IDE3MS4yNSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxODcuMDAgMjIzLjk1LDE5MS43MyAyMjguOTYsMTkxLjg0IDIyNC45NiwxOTQuODcgMjI2LjQxLDE5OS42NiAyMjIuMzAsMTk2LjgwIDIxOC4xOSwxOTkuNjYgMjE5LjY0LDE5NC44NyAyMTUuNjQsMTkxLjg0IDIyMC42NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCwxODcuMDAgMjczLjM1LDE5MS43MyAyNzguMzYsMTkxLjg0IDI3NC4zNiwxOTQuODcgMjc1LjgxLDE5OS42NiAyNzEuNzAsMTk2LjgwIDI2Ny41OSwxOTkuNjYgMjY5LjA0LDE5NC44NyAyNjUuMDQsMTkxLjg0IDI3MC4wNSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48L3N2Zz4=" alt="United States flag"><span class="official-site-text">An official website of the United States</span><button id="official-site-how-toggle" class="official-site-how-toggle" type="button" aria-expanded="false" aria-controls="official-site-how"><span class="official-site-how-label">Here's how you know</span> <span class="official-site-chevron" aria-hidden="true">⌄</span></button></div>
     <div id="official-site-how" class="official-site-how" aria-hidden="true"><div class="official-site-how-inner"><div class="official-site-lock" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M17 9h-1V7a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9h14v-9a2 2 0 0 0-2-2Zm-7-2a2 2 0 1 1 4 0v2h-4V7Zm3 8.73V18h-2v-2.27a2 2 0 1 1 2 0Z"/></svg></div><div class="official-site-how-copy"><strong>Secure C-8 websites use HTTPS</strong><p>A lock (<span aria-label="lock">🔒</span>) or <span class="https-emphasis">https://</span> means you've safely connected to the C-8 website. Share sensitive information only on official, secure websites.</p></div></div></div>
@@ -40132,9 +40201,29 @@ LOGIN_PAGE_HTML = r'''<!doctype html>
   })();
   (function () {
     const $ = function (id) { return document.getElementById(id); };
+    function gatewayWatermark(){
+      const canvas=$('c8-capture-watermark');if(!canvas)return;
+      const width=Math.max(1,Number(window.innerWidth)||1024),height=Math.max(1,Number(window.innerHeight)||768);
+      const ratio=Math.max(1,Math.min(1.5,Number(window.devicePixelRatio)||1));
+      canvas.width=Math.min(3840,Math.round(width*ratio));canvas.height=Math.min(2160,Math.round(height*ratio));
+      const ctx=canvas.getContext('2d');if(!ctx)return;
+      ctx.setTransform(canvas.width/width,0,0,canvas.height/height,0,0);
+      ctx.clearRect(0,0,width,height);
+      ctx.fillStyle='#071a33';ctx.textAlign='center';
+      const stamp=new Date().toISOString().slice(0,16).replace('T',' ')+' UTC';
+      for(let y=-140;y<height+200;y+=175)for(let x=-180;x<width+280;x+=355){
+        ctx.save();ctx.translate(x,y);ctx.rotate(-0.26);
+        ctx.font='bold 15px Arial,sans-serif';ctx.fillText('C-8 SECURE GATEWAY',0,0,330);
+        ctx.font='bold 12px Arial,sans-serif';ctx.fillText(stamp,0,22,330);
+        ctx.restore();
+      }
+    }
+    gatewayWatermark();
+    window.addEventListener('resize',gatewayWatermark);
+    window.setInterval(gatewayWatermark,30000);
     // The gateway uses the same visual shortcut deterrent as the authenticated console.
     let captureFocused=true, captureHeld=false, captureUntil=0, captureTimer=null;
-    const lastCaptureReport={ctrl_shift:0,print_screen:0};
+    const lastCaptureReport={ctrl_shift:0,print_screen:0,system_snip:0,mac_capture:0,print_dialog:0};
     function captureSync(){
       const hold=Math.max(0,captureUntil-Date.now());
       document.body.classList.toggle('c8-capture-veil',document.visibilityState==='hidden'||!captureFocused||captureHeld||hold>0);
@@ -40158,10 +40247,17 @@ LOGIN_PAGE_HTML = r'''<!doctype html>
       captureSync();
     });
     document.addEventListener('keydown',function(event){
+      const key=String(event.key||'').toLowerCase();
       if(event.key==='PrintScreen'||event.code==='PrintScreen'){
         event.preventDefault();
         captureUntil=Date.now()+2000;captureSync();
         if(!event.repeat)captureReport('print_screen');
+      }else if((event.ctrlKey||event.metaKey)&&!event.altKey&&key==='p'){
+        event.preventDefault();captureUntil=Date.now()+4000;captureSync();captureReport('print_dialog');
+      }else if(event.metaKey&&event.shiftKey&&!event.ctrlKey&&!event.altKey&&key==='s'){
+        event.preventDefault();captureUntil=Date.now()+3000;captureSync();captureReport('system_snip');
+      }else if(event.metaKey&&event.shiftKey&&!event.ctrlKey&&!event.altKey&&['3','4','5'].includes(key)){
+        event.preventDefault();captureUntil=Date.now()+3000;captureSync();captureReport('mac_capture');
       }else if(event.ctrlKey&&event.shiftKey&&!event.altKey&&!event.metaKey){
         event.preventDefault();
         const first=!captureHeld;
@@ -40169,6 +40265,8 @@ LOGIN_PAGE_HTML = r'''<!doctype html>
         if(first)captureReport('ctrl_shift');
       }
     },true);
+    window.addEventListener('beforeprint',function(){captureUntil=Date.now()+4000;captureSync();captureReport('print_dialog');});
+    window.addEventListener('afterprint',function(){captureUntil=Date.now()+1500;captureSync();});
     document.addEventListener('keyup',function(event){
       if(captureHeld&&!(event.ctrlKey&&event.shiftKey)){
         captureHeld=false;captureUntil=Date.now()+2000;captureSync();
@@ -40791,6 +40889,7 @@ def render_page(csp_nonce: str = "", session: Optional[Dict[str, Any]] = None) -
         "is_admin": role == "admin",
         "username": str((session or {}).get("username") or "")[:150],
         "user_id": (session or {}).get("user_id"),
+        "viewer_ip": (PRIVACY_SUPPRESSED_IP_LABEL if _privacy_value_has_suppressed_ip(str((session or {}).get("client") or "")) else str((session or {}).get("client") or ""))[:64],
     }
     bootstrap_json = json.dumps(bootstrap, ensure_ascii=False, separators=(",", ":"))
     bootstrap_json = bootstrap_json.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
@@ -43621,7 +43720,7 @@ class Handler(BaseHTTPRequestHandler):
                 shortcut = str(payload.get("shortcut") or "")
                 page_path = str(payload.get("page_path") or "")
                 module = str(payload.get("module") or "")
-                if (shortcut not in {"ctrl_shift", "print_screen"}
+                if (shortcut not in {"ctrl_shift", "print_screen", "system_snip", "mac_capture", "print_dialog"}
                         or not page_path.startswith("/") or page_path.startswith("//")
                         or len(page_path) > 255 or re.search(r"[?#\\\x00-\x1f\x7f]", page_path)
                         or len(module) > 120 or re.search(r"[\x00-\x1f\x7f]", module)):
@@ -43635,7 +43734,7 @@ class Handler(BaseHTTPRequestHandler):
                              "module": module or "Secure Gateway",
                              "user_id": (capture_session or {}).get("user_id"),
                              "account_role": (capture_session or {}).get("role") if capture_session else "anonymous",
-                             "interpretation": "Browser-reported key combination; screenshot unconfirmed."},
+                             "interpretation": "Browser-reported shortcut or print event; screenshot unconfirmed."},
                 )
                 self._json(200, {"ok": True})
                 return
