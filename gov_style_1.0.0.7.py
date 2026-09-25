@@ -741,7 +741,7 @@ except Exception:
 AGENCY_NAME = "C-8"
 SYSTEM_NAME = "Console"
 # r20: GreyNoise Community integrated into Analyze; 404=no-record handling; verified scan rows synchronized.
-APP_VERSION = "3.46.0-c8-integrated-hardening-r119"
+APP_VERSION = "3.46.0-c8-integrated-hardening-r121"
 
 
 # ============================================================================
@@ -9051,15 +9051,97 @@ def _sanitize_client_event_value(value: Any, key: str = "", depth: int = 0) -> A
     return str(value).replace("\x00", "")[:500]
 
 
+_INTERACTION_NAMED_KEYS = {
+    "Tab", "Enter", "Escape", "Backspace", "Delete", "Insert", "Home", "End",
+    "PageUp", "PageDown", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "Ctrl", "Alt", "Shift", "Meta",
+}
+_INTERACTION_SAFE_TAGS = {
+    "a", "button", "input", "select", "textarea", "summary", "div", "span", "label",
+    "img", "svg", "path", "p", "td", "th", "tr", "table", "form", "main", "section",
+    "article", "nav", "header", "footer", "li", "ul", "ol", "h1", "h2", "h3", "body",
+}
+
+
+def _sanitize_interaction_batch_details(details: Dict[str, Any]) -> Dict[str, Any]:
+    """Allow only non-content key labels and click control metadata into signed audit rows."""
+    items = details.get("events")
+    clean: List[Dict[str, Any]] = []
+    if not isinstance(items, list):
+        items = []
+    for item in items[:40]:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind")
+        if kind not in {"key", "typing", "click"}:
+            continue
+        event: Dict[str, Any] = {"kind": kind}
+        at = str(item.get("at") or "")
+        if re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", at):
+            event["at"] = at  # Browser-reported; the audit row also has a server timestamp.
+        if kind in {"key", "typing"}:
+            try:
+                event["count"] = max(1, min(int(item.get("count") or 1), 500))
+            except (ValueError, TypeError, OverflowError):
+                event["count"] = 1
+        if kind == "key":
+            label = str(item.get("label") or "")
+            if label not in _INTERACTION_NAMED_KEYS and not re.fullmatch(r"F(?:[1-9]|1\d|2[0-4])", label):
+                parts = label.split("+")
+                modifiers = parts[:-1]
+                final = parts[-1]
+                if (not modifiers or len(modifiers) > 3 or len(set(modifiers)) != len(modifiers)
+                        or not set(modifiers) <= {"Ctrl", "Alt", "Shift", "Meta"}
+                        or not set(modifiers) & {"Ctrl", "Alt", "Meta"}
+                        or not (re.fullmatch(r"[A-Z0-9]", final)
+                                or final in _INTERACTION_NAMED_KEYS
+                                or re.fullmatch(r"F(?:[1-9]|1\d|2[0-4])", final))):
+                    continue
+            event["label"] = label
+        elif kind == "click":
+            raw = item.get("target")
+            if not isinstance(raw, dict):
+                continue
+            tag = str(raw.get("tag") or "").lower()
+            if tag not in _INTERACTION_SAFE_TAGS:
+                continue
+            target: Dict[str, Any] = {"tag": tag}
+            control_type = str(raw.get("control_type") or "").lower()
+            if control_type in {"password", "hidden"} or any(re.search(
+                r"password|passphrase|secret|token|credential|authorization|csrf", str(raw.get(field) or ""), re.I
+            ) for field in ("id", "name")):
+                continue
+            if re.fullmatch(r"[a-z0-9_-]{1,32}", control_type):
+                target["control_type"] = control_type
+            for field in ("id", "name", "role"):
+                value = str(raw.get(field) or "")
+                if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", value) and not re.search(
+                    r"password|passphrase|secret|token|credential|authorization|csrf|email|username", value, re.I
+                ):
+                    target[field] = value
+            origin = str(raw.get("href_origin") or "")
+            if tag == "a" and origin in {"same-origin", "external"}:
+                target["href_origin"] = origin
+            event["target"] = target
+        clean.append(event)
+    try:
+        dropped = max(0, min(int(details.get("dropped") or 0), 100000))
+    except (ValueError, TypeError, OverflowError):
+        dropped = 0
+    return {"events": clean, "dropped": dropped}
+
+
 def _sanitize_client_event_payload(payload: Any) -> Dict[str, Any]:
     source = payload if isinstance(payload, dict) else {}
     details = source.get("details") if isinstance(source.get("details"), dict) else {}
+    action = re.sub(r"[^A-Za-z0-9_.:-]", "", str(source.get("action") or "client_event"))[:160] or "client_event"
     clean: Dict[str, Any] = {
-        "action": re.sub(r"[^A-Za-z0-9_.:-]", "", str(source.get("action") or "client_event"))[:160] or "client_event",
+        "action": action,
         "module": str(source.get("module") or "Console").replace("\x00", "")[:120],
         "visitor_id": _clean_visitor_id(source.get("visitor_id")),
         "path": str(source.get("path") or "").split("?", 1)[0][:255],
-        "details": _sanitize_client_event_value(details, "details"),
+        "details": (_sanitize_interaction_batch_details(details) if action == "interaction_batch"
+                    else _sanitize_client_event_value(details, "details")),
     }
     client_info = source.get("client_info")
     if isinstance(client_info, dict):
@@ -33305,9 +33387,78 @@ function c8InteractionAudit(action,details){
 }
 let c8InteractionAuditReady=false;
 const c8InputAuditTimers=new WeakMap();
+const c8InteractionBatch=[];
+let c8InteractionTimer=null;
+let c8InteractionDropped=0;
+let c8InteractionModule='';
+let c8InteractionMode='';
+function c8InteractionAllowed(){
+  return state.authenticated&&state.csrf?'user':((($('login-terms-inline')||{}).checked)?'visitor':'');
+}
+function c8FlushInteractionAudit(){
+  if(c8InteractionTimer){clearTimeout(c8InteractionTimer);c8InteractionTimer=null;}
+  const mode=c8InteractionMode, events=c8InteractionBatch.splice(0,40), dropped=c8InteractionDropped;
+  c8InteractionDropped=0; c8InteractionMode='';
+  if(!events.length||mode!==c8InteractionAllowed())return;
+  const body={action:'interaction_batch',module:c8InteractionModule||'Console',details:{events,dropped}};
+  if(mode==='user'){
+    fetch('/api/activity/client-event',{method:'POST',credentials:'same-origin',cache:'no-store',keepalive:true,
+      headers:{'Content-Type':'application/json','X-CSRF-Token':state.csrf,'X-C8-Module':body.module},body:JSON.stringify(body)}).catch(()=>{});
+  }else if(mode==='visitor'){
+    c8VisitorClientEvent(body.action,body.details);
+  }
+}
+function c8QueueInteractionAudit(entry){
+  const mode=c8InteractionAllowed();
+  if(!mode)return;
+  const module=String(state.current||'Gateway').slice(0,120);
+  if(c8InteractionBatch.length&&(mode!==c8InteractionMode||module!==c8InteractionModule))c8FlushInteractionAudit();
+  c8InteractionMode=mode; c8InteractionModule=module;
+  const prior=c8InteractionBatch[c8InteractionBatch.length-1];
+  if(prior&&entry.kind!=='click'&&prior.kind===entry.kind&&prior.label===entry.label&&prior.count<500){
+    prior.count++; // Repeated typing is a count, never a sequence of characters.
+  }else if(c8InteractionBatch.length<40){
+    c8InteractionBatch.push(entry);
+  }else{
+    c8InteractionDropped++;
+  }
+  if(!c8InteractionTimer)c8InteractionTimer=setTimeout(c8FlushInteractionAudit,5000);
+}
+function c8SafeClickTarget(raw){
+  const meta=c8InteractionTarget(raw);
+  if(!meta.tag){return {tag:String(raw?.tagName||'').toLowerCase().slice(0,24)};}
+  const identity=[meta.id,meta.name,meta.control_type].join(' ').toLowerCase();
+  if(/password|passphrase|secret|token|credential|authorization|csrf/.test(identity))return {};
+  return {tag:meta.tag,id:meta.id||'',name:meta.name||'',role:meta.role||'',control_type:meta.control_type||'',href_origin:meta.href_origin||''};
+}
+function c8SafeKeyLabel(ev){
+  if(ev.isComposing||ev.key==='Dead'||ev.key==='Process'||ev.getModifierState?.('AltGraph'))return 'typing';
+  const key=({Control:'Ctrl',OS:'Meta',Esc:'Escape'}[ev.key])||String(ev.key||'');
+  const named=new Set(['Tab','Enter','Escape','Backspace','Delete','Insert','Home','End','PageUp','PageDown','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Ctrl','Alt','Shift','Meta']);
+  const plain=named.has(key)||/^F(?:[1-9]|1\d|2[0-4])$/.test(key);
+  const mods=[ev.ctrlKey?'Ctrl':'',ev.altKey?'Alt':'',ev.shiftKey?'Shift':'',ev.metaKey?'Meta':''].filter(Boolean);
+  if((ev.ctrlKey||ev.altKey||ev.metaKey)&&mods.length<=3){
+    const final=plain?key:(key.length===1&&/^[A-Z0-9]$/i.test(key)?key.toUpperCase():'');
+    if(final&&!mods.includes(final))return mods.concat(final).join('+');
+  }
+  if(plain)return key;
+  return key.length===1?'typing':'';
+}
 function c8InstallInteractionAudit(){
   if(c8InteractionAuditReady)return; c8InteractionAuditReady=true;
-  document.addEventListener('click',ev=>{ const target=c8InteractionTarget(ev.target); if(target.tag)c8InteractionAudit('ui_click',{target}); },true);
+  document.addEventListener('click',ev=>{
+    const target=c8SafeClickTarget(ev.target);
+    if(target.tag)c8QueueInteractionAudit({kind:'click',target,at:new Date().toISOString()});
+  },true);
+  document.addEventListener('keydown',ev=>{
+    const el=ev.target;
+    const identity=[el?.id,el?.getAttribute?.('name'),el?.getAttribute?.('type')].join(' ').toLowerCase();
+    if(/password|passphrase|secret|token|credential|authorization|csrf/.test(identity))return;
+    const label=c8SafeKeyLabel(ev);
+    if(label)c8QueueInteractionAudit(label==='typing'?{kind:'typing',count:1,at:new Date().toISOString()}:{kind:'key',label,count:1,at:new Date().toISOString()});
+  },true);
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')c8FlushInteractionAudit();});
+  window.addEventListener('pagehide',c8FlushInteractionAudit);
   document.addEventListener('change',ev=>{ const field=c8FieldInteraction(ev.target); if(field.tag)c8InteractionAudit('field_change',{field}); },true);
   document.addEventListener('input',ev=>{
     const el=ev.target; if(!el||!el.matches||!el.matches('input,select,textarea,[contenteditable="true"]'))return;
@@ -33319,6 +33470,7 @@ function c8InstallInteractionAudit(){
 function fileToB64(file){ return new Promise((resolve,reject)=>{ const reader = new FileReader(); reader.onerror=()=>reject(reader.error); reader.onload=()=>{ const s=String(reader.result||''); resolve(s.includes(',') ? s.split(',',2)[1] : s); }; reader.readAsDataURL(file); }); }
 function switchToolTab(group, tab){ document.querySelectorAll(`[data-tab-group="${group}"]`).forEach(el=>el.classList.toggle('hidden', el.dataset.tab!==tab)); document.querySelectorAll(`#${group}-tabs .tool-tab, .tool-tabs .tool-tab`).forEach(btn=>{ const on=btn.getAttribute('onclick')&&btn.getAttribute('onclick').includes(`'${group}','${tab}'`); if(btn.getAttribute('onclick')&&btn.getAttribute('onclick').includes(`'${group}',`)) btn.classList.toggle('active', !!on); }); if(group==='prof') profUpdateProgress?.(); }
 function showLogin(message){
+  c8FlushInteractionAudit();
   c8BootComplete = true;
   state.authenticated = false;
   state.csrf = null;
@@ -33341,6 +33493,7 @@ function applySessionRole(data){
   state.viewerIp = String((data||{}).viewer_ip || state.viewerIp || C8_BOOTSTRAP_SESSION?.viewer_ip || '').slice(0,64);
 }
 function showApp(){
+  c8FlushInteractionAudit();
   c8BootComplete = true;
   state.authenticated = true;
   $('loading').classList.add('hidden');
@@ -37623,14 +37776,29 @@ function adminActivityDetailBlock(e){
   };
   return `<details><summary>${securityChip('Full details','info')}</summary><pre class="hardware-lines security-detail ${esc(e.error?'high':'low')}">${esc(adminActivityPretty(detail))}</pre></details>`;
 }
+function adminInteractionSummary(e){
+  const items=Array.isArray(e?.payload?.details?.events)?e.payload.details.events:[];
+  const parts=items.slice(0,8).map(item=>{
+    const count=Math.max(1,Number(item.count)||1);
+    if(item.kind==='typing')return `typing (${count} key${count===1?'':'s'})`;
+    if(item.kind==='key')return `${String(item.label||'key')} (${count})`;
+    const target=item.target||{};
+    return `click ${String(target.tag||'control')}${target.id?' #'+target.id:''}`;
+  });
+  const dropped=Math.max(0,Number(e?.payload?.details?.dropped)||0);
+  if(items.length>8)parts.push(`+${items.length-8} more`);
+  if(dropped)parts.push(`${dropped} omitted during heavy activity`);
+  return parts.join(' · ')||'No key or click metadata';
+}
 function adminActivityPaint(){
   const root=$('admin-activity-result'); if(!root) return;
   const q=String(($('admin-activity-search')||{}).value||'').trim().toLowerCase();
   const user=String(($('admin-activity-user')||{}).value||'').trim().toLowerCase();
   const module=String(($('admin-activity-module')||{}).value||'').trim().toLowerCase();
+  const type=String(($('admin-activity-type')||{}).value||'');
   const events=(adminActivityCache.events||[]).filter(e=>{
     const hay=[e.created_at,e.username,e.user_id,e.role,e.remote_ip,e.forwarded_for,e.module,e.action,e.path,e.status,e.request_fingerprint,e.activity_correlation_tag,e.user_agent_sha256,e.session_tag,adminActivityPretty(e.request),adminActivityPretty(e.device),adminActivityPretty(e.audit),adminActivityPretty(e.target),adminActivityPretty(e.payload),e.error].join(' ').toLowerCase();
-    return (!q||hay.includes(q))&&(!user||String(e.username||'').toLowerCase()===user)&&(!module||String(e.module||'').toLowerCase()===module);
+    return (!q||hay.includes(q))&&(!user||String(e.username||'').toLowerCase()===user)&&(!module||String(e.module||'').toLowerCase()===module)&&(!type||e.action==='interaction_batch');
   });
   if(!events.length){ root.innerHTML='<div class="users-empty">No activity records match the current filters.</div>'; return; }
   root.innerHTML=`<div class="admin-user-history-wrap"><table><thead><tr><th>Time</th><th>User / session</th><th>Network</th><th>Module / action</th><th>Request & security</th><th>Device</th><th>Target</th><th>Audit tags</th><th>Details</th><th>Status</th></tr></thead><tbody>${events.map(e=>{
@@ -37648,6 +37816,8 @@ function adminActivityPaint(){
       <td>${securityChip(e.status||'received',statusTone)}</td>
     </tr>`;
   }).join('')}</tbody></table></div>`;
+  const interactions=events.filter(e=>e.action==='interaction_batch').slice(0,25);
+  if(interactions.length)root.insertAdjacentHTML('afterbegin',`<div class="card"><h3>Key &amp; click logs</h3><p class="muted">Recent browser-reported activity. Typing is counted without characters; password fields are excluded. Each audit row has a server timestamp and authenticated identity.</p><div class="admin-user-history-wrap"><table><thead><tr><th>Recorded at (UTC)</th><th>User / IP</th><th>Module</th><th>Keys &amp; clicks</th><th>Events</th></tr></thead><tbody>${interactions.map(e=>`<tr><td>${esc(e.created_at||'')}</td><td>${esc(e.username||'')}<br><span class="muted">${esc(e.remote_ip||'')}</span></td><td>${esc(e.module||'')}</td><td>${esc(adminInteractionSummary(e))}</td><td><details><summary>Show event metadata</summary><pre class="hardware-lines">${esc(adminActivityPretty(e.payload?.details?.events||[]))}</pre></details></td></tr>`).join('')}</tbody></table></div></div>`);
 }
 async function adminActivityLoad(showErrors=true){
   if(!state.isAdmin){ showLogin('Admin role required.'); return; }
@@ -37668,7 +37838,7 @@ async function adminActivityLoad(showErrors=true){
     adminActivityPaint();
   }catch(e){ if(root&&showErrors)root.innerHTML=`<div class="online-users-error">${esc(e.message||String(e))}</div>`; }
 }
-RENDER['Activity Logs']=()=>`<div class="module-note">Administrator-only detailed audit of console activity. Shows user/session identity, IP and forwarded IP, request security metadata, browser/device summary, target fields, sanitized payloads, and server-keyed correlation tags. Passwords, encryption material, raw uploaded files, and encryption/decryption text are redacted.</div><div class="admin-users-summary"><div class="stat"><strong id="admin-activity-count">0</strong><span>Recent events (up to 5000)</span></div><div class="stat"><strong id="admin-activity-user-count">0</strong><span>Users</span></div><div class="stat"><strong id="admin-activity-module-count">0</strong><span>Modules</span></div><div class="stat"><strong id="admin-activity-signal-count">0</strong><span>Security signals</span></div><div class="stat"><strong id="admin-activity-error-count">0</strong><span>Errors / denied</span></div></div><div class="card"><div class="form-grid-3"><div class="field"><label>Search activity</label><input id="admin-activity-search" placeholder="query, target, user, IP, action, device, fingerprint" oninput="adminActivityPaint()"></div><div class="field"><label>User</label><select id="admin-activity-user" onchange="adminActivityPaint()"><option value="">All users</option></select></div><div class="field"><label>Module</label><select id="admin-activity-module" onchange="adminActivityPaint()"><option value="">All modules</option></select></div></div><div class="actions"><button class="secondary-btn" onclick="adminActivityLoad(true)">Refresh Activity</button></div><p class="muted">Last generated: <span id="admin-activity-time">Waiting</span></p></div><div id="admin-activity-result"><div class="users-empty">Loading user activity...</div></div>`;
+RENDER['Activity Logs']=()=>`<div class="module-note">Administrator-only detailed audit of console activity, including browser-reported key categories, shortcut labels, typing counts, and clicked controls for every signed-in user. Passwords, typed characters, encryption material, raw uploaded files, and encryption/decryption text are excluded.</div><div class="admin-users-summary"><div class="stat"><strong id="admin-activity-count">0</strong><span>Recent events (up to 5000)</span></div><div class="stat"><strong id="admin-activity-user-count">0</strong><span>Users</span></div><div class="stat"><strong id="admin-activity-module-count">0</strong><span>Modules</span></div><div class="stat"><strong id="admin-activity-signal-count">0</strong><span>Security signals</span></div><div class="stat"><strong id="admin-activity-error-count">0</strong><span>Errors / denied</span></div></div><div class="card"><div class="form-grid-3"><div class="field"><label>Search activity</label><input id="admin-activity-search" placeholder="query, target, user, IP, action, device, fingerprint" oninput="adminActivityPaint()"></div><div class="field"><label>User</label><select id="admin-activity-user" onchange="adminActivityPaint()"><option value="">All users</option></select></div><div class="field"><label>Module</label><select id="admin-activity-module" onchange="adminActivityPaint()"><option value="">All modules</option></select></div><div class="field"><label>Event type</label><select id="admin-activity-type" onchange="adminActivityPaint()"><option value="">All activity</option><option value="interactions">Keys &amp; clicks</option></select></div></div><div class="actions"><button class="secondary-btn" onclick="adminActivityLoad(true)">Refresh Activity</button></div><p class="muted">Last generated: <span id="admin-activity-time">Waiting</span></p></div><div id="admin-activity-result"><div class="users-empty">Loading user activity...</div></div>`;
 
 let adminVisitorCache={events:[]};
 function adminVisitorDeviceSummary(v){
@@ -38217,6 +38387,7 @@ function moduleVisibleToCurrentRole(name){
 }
 function showModule(name){
   if(!moduleVisibleToCurrentRole(name)){ name='Overview'; }
+  if(state.current!==name)c8FlushInteractionAudit();
   if(state.current==='Dome' && name!=='Dome'){
     domeStop(false);
     domeStopLiveLoop();
@@ -39712,8 +39883,8 @@ def _security_contact_page_bytes() -> bytes:
     return html.encode("utf-8")
 
 
-TERMS_VERSION = "2.10"
-TERMS_EFFECTIVE_DATE = "24 July 2026"
+TERMS_VERSION = "2.11"
+TERMS_EFFECTIVE_DATE = "25 September 2026"
 
 
 LOGIN_PAGE_HTML = r'''<!doctype html>
@@ -40117,14 +40288,12 @@ LOGIN_PAGE_HTML = r'''<!doctype html>
       .fact:last-child { border-bottom: 0; }
       .notice, .gateway { padding: 21px; }
     }
-    .c8-no-screenshots{position:fixed;z-index:10000;right:10px;bottom:10px;padding:6px 10px;border:2px solid #fff;background:#8a1f1f;color:#fff;font:800 .74rem/1.25 Arial,sans-serif;pointer-events:none}
     .c8-capture-watermark{position:fixed;inset:0;width:100%;height:100%;z-index:9990;pointer-events:none;opacity:.14}
     body.c8-capture-veil::after{content:"SENSITIVE CONTENT HIDDEN WHILE THE WINDOW IS INACTIVE";position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:24px;text-align:center;background:#071a33;color:#fff;font:800 clamp(1rem,3vw,1.5rem)/1.4 Arial,sans-serif;letter-spacing:.06em;pointer-events:none}
     @media print{body > *{display:none!important}body::before{content:"SENSITIVE — Printing this page is disabled.";display:block!important;padding:24px;font:18pt Arial,sans-serif;color:#000;background:#fff}body::after{display:none!important}}
   </style>
 </head>
 <body>
-  <div class="c8-no-screenshots" role="note">SENSITIVE · NO SCREENSHOTS</div>
   <canvas id="c8-capture-watermark" class="c8-capture-watermark" aria-hidden="true"></canvas>
   <div class="official-banner" role="note" aria-label="Official website notice">
     <div class="official-banner-inner"><img class="official-site-flag" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA3NDEgMzkwIiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlVuaXRlZCBTdGF0ZXMgZmxhZyI+PHJlY3QgeD0iMCIgeT0iMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjMwIiB3aWR0aD0iNzQxIiBoZWlnaHQ9IjMwIiBmaWxsPSIjRkZGRkZGIi8+PHJlY3QgeD0iMCIgeT0iNjAiIHdpZHRoPSI3NDEiIGhlaWdodD0iMzAiIGZpbGw9IiNCMzE5NDIiLz48cmVjdCB4PSIwIiB5PSI5MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjEyMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjE1MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjE4MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjIxMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjI0MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjI3MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjMwMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjMzMCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0ZGRkZGRiIvPjxyZWN0IHg9IjAiIHk9IjM2MCIgd2lkdGg9Ijc0MSIgaGVpZ2h0PSIzMCIgZmlsbD0iI0IzMTk0MiIvPjxyZWN0IHg9IjAiIHk9IjAiIHdpZHRoPSIyOTYuNCIgaGVpZ2h0PSIyMTAiIGZpbGw9IiMwQTMxNjEiLz48cG9seWdvbiBwb2ludHM9IjI0LjcwLDExLjAwIDI2LjM1LDE1LjczIDMxLjM2LDE1Ljg0IDI3LjM2LDE4Ljg3IDI4LjgxLDIzLjY2IDI0LjcwLDIwLjgwIDIwLjU5LDIzLjY2IDIyLjA0LDE4Ljg3IDE4LjA0LDE1Ljg0IDIzLjA1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxMS4wMCA3NS43NSwxNS43MyA4MC43NiwxNS44NCA3Ni43NiwxOC44NyA3OC4yMSwyMy42NiA3NC4xMCwyMC44MCA2OS45OSwyMy42NiA3MS40NCwxOC44NyA2Ny40NCwxNS44NCA3Mi40NSwxNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTIzLjUwLDExLjAwIDEyNS4xNSwxNS43MyAxMzAuMTYsMTUuODQgMTI2LjE2LDE4Ljg3IDEyNy42MSwyMy42NiAxMjMuNTAsMjAuODAgMTE5LjM5LDIzLjY2IDEyMC44NCwxOC44NyAxMTYuODQsMTUuODQgMTIxLjg1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxNzIuOTAsMTEuMDAgMTc0LjU1LDE1LjczIDE3OS41NiwxNS44NCAxNzUuNTYsMTguODcgMTc3LjAxLDIzLjY2IDE3Mi45MCwyMC44MCAxNjguNzksMjMuNjYgMTcwLjI0LDE4Ljg3IDE2Ni4yNCwxNS44NCAxNzEuMjUsMTUuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxMS4wMCAyMjMuOTUsMTUuNzMgMjI4Ljk2LDE1Ljg0IDIyNC45NiwxOC44NyAyMjYuNDEsMjMuNjYgMjIyLjMwLDIwLjgwIDIxOC4xOSwyMy42NiAyMTkuNjQsMTguODcgMjE1LjY0LDE1Ljg0IDIyMC42NSwxNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjcxLjcwLDExLjAwIDI3My4zNSwxNS43MyAyNzguMzYsMTUuODQgMjc0LjM2LDE4Ljg3IDI3NS44MSwyMy42NiAyNzEuNzAsMjAuODAgMjY3LjU5LDIzLjY2IDI2OS4wNCwxOC44NyAyNjUuMDQsMTUuODQgMjcwLjA1LDE1LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI0OS40MCwzMy4wMCA1MS4wNSwzNy43MyA1Ni4wNiwzNy44NCA1Mi4wNiw0MC44NyA1My41MSw0NS42NiA0OS40MCw0Mi44MCA0NS4yOSw0NS42NiA0Ni43NCw0MC44NyA0Mi43NCwzNy44NCA0Ny43NSwzNy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMzMuMDAgMTAwLjQ1LDM3LjczIDEwNS40NiwzNy44NCAxMDEuNDYsNDAuODcgMTAyLjkxLDQ1LjY2IDk4LjgwLDQyLjgwIDk0LjY5LDQ1LjY2IDk2LjE0LDQwLjg3IDkyLjE0LDM3Ljg0IDk3LjE1LDM3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxNDguMjAsMzMuMDAgMTQ5Ljg1LDM3LjczIDE1NC44NiwzNy44NCAxNTAuODYsNDAuODcgMTUyLjMxLDQ1LjY2IDE0OC4yMCw0Mi44MCAxNDQuMDksNDUuNjYgMTQ1LjU0LDQwLjg3IDE0MS41NCwzNy44NCAxNDYuNTUsMzcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE5Ny42MCwzMy4wMCAxOTkuMjUsMzcuNzMgMjA0LjI2LDM3Ljg0IDIwMC4yNiw0MC44NyAyMDEuNzEsNDUuNjYgMTk3LjYwLDQyLjgwIDE5My40OSw0NS42NiAxOTQuOTQsNDAuODcgMTkwLjk0LDM3Ljg0IDE5NS45NSwzNy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDMzLjAwIDI0OC42NSwzNy43MyAyNTMuNjYsMzcuODQgMjQ5LjY2LDQwLjg3IDI1MS4xMSw0NS42NiAyNDcuMDAsNDIuODAgMjQyLjg5LDQ1LjY2IDI0NC4zNCw0MC44NyAyNDAuMzQsMzcuODQgMjQ1LjM1LDM3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyNC43MCw1NS4wMCAyNi4zNSw1OS43MyAzMS4zNiw1OS44NCAyNy4zNiw2Mi44NyAyOC44MSw2Ny42NiAyNC43MCw2NC44MCAyMC41OSw2Ny42NiAyMi4wNCw2Mi44NyAxOC4wNCw1OS44NCAyMy4wNSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iNzQuMTAsNTUuMDAgNzUuNzUsNTkuNzMgODAuNzYsNTkuODQgNzYuNzYsNjIuODcgNzguMjEsNjcuNjYgNzQuMTAsNjQuODAgNjkuOTksNjcuNjYgNzEuNDQsNjIuODcgNjcuNDQsNTkuODQgNzIuNDUsNTkuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCw1NS4wMCAxMjUuMTUsNTkuNzMgMTMwLjE2LDU5Ljg0IDEyNi4xNiw2Mi44NyAxMjcuNjEsNjcuNjYgMTIzLjUwLDY0LjgwIDExOS4zOSw2Ny42NiAxMjAuODQsNjIuODcgMTE2Ljg0LDU5Ljg0IDEyMS44NSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTcyLjkwLDU1LjAwIDE3NC41NSw1OS43MyAxNzkuNTYsNTkuODQgMTc1LjU2LDYyLjg3IDE3Ny4wMSw2Ny42NiAxNzIuOTAsNjQuODAgMTY4Ljc5LDY3LjY2IDE3MC4yNCw2Mi44NyAxNjYuMjQsNTkuODQgMTcxLjI1LDU5LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyMjIuMzAsNTUuMDAgMjIzLjk1LDU5LjczIDIyOC45Niw1OS44NCAyMjQuOTYsNjIuODcgMjI2LjQxLDY3LjY2IDIyMi4zMCw2NC44MCAyMTguMTksNjcuNjYgMjE5LjY0LDYyLjg3IDIxNS42NCw1OS44NCAyMjAuNjUsNTkuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCw1NS4wMCAyNzMuMzUsNTkuNzMgMjc4LjM2LDU5Ljg0IDI3NC4zNiw2Mi44NyAyNzUuODEsNjcuNjYgMjcxLjcwLDY0LjgwIDI2Ny41OSw2Ny42NiAyNjkuMDQsNjIuODcgMjY1LjA0LDU5Ljg0IDI3MC4wNSw1OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iNDkuNDAsNzcuMDAgNTEuMDUsODEuNzMgNTYuMDYsODEuODQgNTIuMDYsODQuODcgNTMuNTEsODkuNjYgNDkuNDAsODYuODAgNDUuMjksODkuNjYgNDYuNzQsODQuODcgNDIuNzQsODEuODQgNDcuNzUsODEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9Ijk4LjgwLDc3LjAwIDEwMC40NSw4MS43MyAxMDUuNDYsODEuODQgMTAxLjQ2LDg0Ljg3IDEwMi45MSw4OS42NiA5OC44MCw4Ni44MCA5NC42OSw4OS42NiA5Ni4xNCw4NC44NyA5Mi4xNCw4MS44NCA5Ny4xNSw4MS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDc3LjAwIDE0OS44NSw4MS43MyAxNTQuODYsODEuODQgMTUwLjg2LDg0Ljg3IDE1Mi4zMSw4OS42NiAxNDguMjAsODYuODAgMTQ0LjA5LDg5LjY2IDE0NS41NCw4NC44NyAxNDEuNTQsODEuODQgMTQ2LjU1LDgxLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxOTcuNjAsNzcuMDAgMTk5LjI1LDgxLjczIDIwNC4yNiw4MS44NCAyMDAuMjYsODQuODcgMjAxLjcxLDg5LjY2IDE5Ny42MCw4Ni44MCAxOTMuNDksODkuNjYgMTk0Ljk0LDg0Ljg3IDE5MC45NCw4MS44NCAxOTUuOTUsODEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI0Ny4wMCw3Ny4wMCAyNDguNjUsODEuNzMgMjUzLjY2LDgxLjg0IDI0OS42Niw4NC44NyAyNTEuMTEsODkuNjYgMjQ3LjAwLDg2LjgwIDI0Mi44OSw4OS42NiAyNDQuMzQsODQuODcgMjQwLjM0LDgxLjg0IDI0NS4zNSw4MS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsOTkuMDAgMjYuMzUsMTAzLjczIDMxLjM2LDEwMy44NCAyNy4zNiwxMDYuODcgMjguODEsMTExLjY2IDI0LjcwLDEwOC44MCAyMC41OSwxMTEuNjYgMjIuMDQsMTA2Ljg3IDE4LjA0LDEwMy44NCAyMy4wNSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9Ijc0LjEwLDk5LjAwIDc1Ljc1LDEwMy43MyA4MC43NiwxMDMuODQgNzYuNzYsMTA2Ljg3IDc4LjIxLDExMS42NiA3NC4xMCwxMDguODAgNjkuOTksMTExLjY2IDcxLjQ0LDEwNi44NyA2Ny40NCwxMDMuODQgNzIuNDUsMTAzLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIxMjMuNTAsOTkuMDAgMTI1LjE1LDEwMy43MyAxMzAuMTYsMTAzLjg0IDEyNi4xNiwxMDYuODcgMTI3LjYxLDExMS42NiAxMjMuNTAsMTA4LjgwIDExOS4zOSwxMTEuNjYgMTIwLjg0LDEwNi44NyAxMTYuODQsMTAzLjg0IDEyMS44NSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCw5OS4wMCAxNzQuNTUsMTAzLjczIDE3OS41NiwxMDMuODQgMTc1LjU2LDEwNi44NyAxNzcuMDEsMTExLjY2IDE3Mi45MCwxMDguODAgMTY4Ljc5LDExMS42NiAxNzAuMjQsMTA2Ljg3IDE2Ni4yNCwxMDMuODQgMTcxLjI1LDEwMy43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjIyLjMwLDk5LjAwIDIyMy45NSwxMDMuNzMgMjI4Ljk2LDEwMy44NCAyMjQuOTYsMTA2Ljg3IDIyNi40MSwxMTEuNjYgMjIyLjMwLDEwOC44MCAyMTguMTksMTExLjY2IDIxOS42NCwxMDYuODcgMjE1LjY0LDEwMy44NCAyMjAuNjUsMTAzLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSIyNzEuNzAsOTkuMDAgMjczLjM1LDEwMy43MyAyNzguMzYsMTAzLjg0IDI3NC4zNiwxMDYuODcgMjc1LjgxLDExMS42NiAyNzEuNzAsMTA4LjgwIDI2Ny41OSwxMTEuNjYgMjY5LjA0LDEwNi44NyAyNjUuMDQsMTAzLjg0IDI3MC4wNSwxMDMuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjQ5LjQwLDEyMS4wMCA1MS4wNSwxMjUuNzMgNTYuMDYsMTI1Ljg0IDUyLjA2LDEyOC44NyA1My41MSwxMzMuNjYgNDkuNDAsMTMwLjgwIDQ1LjI5LDEzMy42NiA0Ni43NCwxMjguODcgNDIuNzQsMTI1Ljg0IDQ3Ljc1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMTIxLjAwIDEwMC40NSwxMjUuNzMgMTA1LjQ2LDEyNS44NCAxMDEuNDYsMTI4Ljg3IDEwMi45MSwxMzMuNjYgOTguODAsMTMwLjgwIDk0LjY5LDEzMy42NiA5Ni4xNCwxMjguODcgOTIuMTQsMTI1Ljg0IDk3LjE1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDEyMS4wMCAxNDkuODUsMTI1LjczIDE1NC44NiwxMjUuODQgMTUwLjg2LDEyOC44NyAxNTIuMzEsMTMzLjY2IDE0OC4yMCwxMzAuODAgMTQ0LjA5LDEzMy42NiAxNDUuNTQsMTI4Ljg3IDE0MS41NCwxMjUuODQgMTQ2LjU1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTk3LjYwLDEyMS4wMCAxOTkuMjUsMTI1LjczIDIwNC4yNiwxMjUuODQgMjAwLjI2LDEyOC44NyAyMDEuNzEsMTMzLjY2IDE5Ny42MCwxMzAuODAgMTkzLjQ5LDEzMy42NiAxOTQuOTQsMTI4Ljg3IDE5MC45NCwxMjUuODQgMTk1Ljk1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDEyMS4wMCAyNDguNjUsMTI1LjczIDI1My42NiwxMjUuODQgMjQ5LjY2LDEyOC44NyAyNTEuMTEsMTMzLjY2IDI0Ny4wMCwxMzAuODAgMjQyLjg5LDEzMy42NiAyNDQuMzQsMTI4Ljg3IDI0MC4zNCwxMjUuODQgMjQ1LjM1LDEyNS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsMTQzLjAwIDI2LjM1LDE0Ny43MyAzMS4zNiwxNDcuODQgMjcuMzYsMTUwLjg3IDI4LjgxLDE1NS42NiAyNC43MCwxNTIuODAgMjAuNTksMTU1LjY2IDIyLjA0LDE1MC44NyAxOC4wNCwxNDcuODQgMjMuMDUsMTQ3LjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxNDMuMDAgNzUuNzUsMTQ3LjczIDgwLjc2LDE0Ny44NCA3Ni43NiwxNTAuODcgNzguMjEsMTU1LjY2IDc0LjEwLDE1Mi44MCA2OS45OSwxNTUuNjYgNzEuNDQsMTUwLjg3IDY3LjQ0LDE0Ny44NCA3Mi40NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCwxNDMuMDAgMTI1LjE1LDE0Ny43MyAxMzAuMTYsMTQ3Ljg0IDEyNi4xNiwxNTAuODcgMTI3LjYxLDE1NS42NiAxMjMuNTAsMTUyLjgwIDExOS4zOSwxNTUuNjYgMTIwLjg0LDE1MC44NyAxMTYuODQsMTQ3Ljg0IDEyMS44NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCwxNDMuMDAgMTc0LjU1LDE0Ny43MyAxNzkuNTYsMTQ3Ljg0IDE3NS41NiwxNTAuODcgMTc3LjAxLDE1NS42NiAxNzIuOTAsMTUyLjgwIDE2OC43OSwxNTUuNjYgMTcwLjI0LDE1MC44NyAxNjYuMjQsMTQ3Ljg0IDE3MS4yNSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxNDMuMDAgMjIzLjk1LDE0Ny43MyAyMjguOTYsMTQ3Ljg0IDIyNC45NiwxNTAuODcgMjI2LjQxLDE1NS42NiAyMjIuMzAsMTUyLjgwIDIxOC4xOSwxNTUuNjYgMjE5LjY0LDE1MC44NyAyMTUuNjQsMTQ3Ljg0IDIyMC42NSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCwxNDMuMDAgMjczLjM1LDE0Ny43MyAyNzguMzYsMTQ3Ljg0IDI3NC4zNiwxNTAuODcgMjc1LjgxLDE1NS42NiAyNzEuNzAsMTUyLjgwIDI2Ny41OSwxNTUuNjYgMjY5LjA0LDE1MC44NyAyNjUuMDQsMTQ3Ljg0IDI3MC4wNSwxNDcuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjQ5LjQwLDE2NS4wMCA1MS4wNSwxNjkuNzMgNTYuMDYsMTY5Ljg0IDUyLjA2LDE3Mi44NyA1My41MSwxNzcuNjYgNDkuNDAsMTc0LjgwIDQ1LjI5LDE3Ny42NiA0Ni43NCwxNzIuODcgNDIuNzQsMTY5Ljg0IDQ3Ljc1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iOTguODAsMTY1LjAwIDEwMC40NSwxNjkuNzMgMTA1LjQ2LDE2OS44NCAxMDEuNDYsMTcyLjg3IDEwMi45MSwxNzcuNjYgOTguODAsMTc0LjgwIDk0LjY5LDE3Ny42NiA5Ni4xNCwxNzIuODcgOTIuMTQsMTY5Ljg0IDk3LjE1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTQ4LjIwLDE2NS4wMCAxNDkuODUsMTY5LjczIDE1NC44NiwxNjkuODQgMTUwLjg2LDE3Mi44NyAxNTIuMzEsMTc3LjY2IDE0OC4yMCwxNzQuODAgMTQ0LjA5LDE3Ny42NiAxNDUuNTQsMTcyLjg3IDE0MS41NCwxNjkuODQgMTQ2LjU1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMTk3LjYwLDE2NS4wMCAxOTkuMjUsMTY5LjczIDIwNC4yNiwxNjkuODQgMjAwLjI2LDE3Mi44NyAyMDEuNzEsMTc3LjY2IDE5Ny42MCwxNzQuODAgMTkzLjQ5LDE3Ny42NiAxOTQuOTQsMTcyLjg3IDE5MC45NCwxNjkuODQgMTk1Ljk1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQ3LjAwLDE2NS4wMCAyNDguNjUsMTY5LjczIDI1My42NiwxNjkuODQgMjQ5LjY2LDE3Mi44NyAyNTEuMTEsMTc3LjY2IDI0Ny4wMCwxNzQuODAgMjQyLjg5LDE3Ny42NiAyNDQuMzQsMTcyLjg3IDI0MC4zNCwxNjkuODQgMjQ1LjM1LDE2OS43MyIgZmlsbD0iI0ZGRkZGRiIvPjxwb2x5Z29uIHBvaW50cz0iMjQuNzAsMTg3LjAwIDI2LjM1LDE5MS43MyAzMS4zNiwxOTEuODQgMjcuMzYsMTk0Ljg3IDI4LjgxLDE5OS42NiAyNC43MCwxOTYuODAgMjAuNTksMTk5LjY2IDIyLjA0LDE5NC44NyAxOC4wNCwxOTEuODQgMjMuMDUsMTkxLjczIiBmaWxsPSIjRkZGRkZGIi8+PHBvbHlnb24gcG9pbnRzPSI3NC4xMCwxODcuMDAgNzUuNzUsMTkxLjczIDgwLjc2LDE5MS44NCA3Ni43NiwxOTQuODcgNzguMjEsMTk5LjY2IDc0LjEwLDE5Ni44MCA2OS45OSwxOTkuNjYgNzEuNDQsMTk0Ljg3IDY3LjQ0LDE5MS44NCA3Mi40NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjEyMy41MCwxODcuMDAgMTI1LjE1LDE5MS43MyAxMzAuMTYsMTkxLjg0IDEyNi4xNiwxOTQuODcgMTI3LjYxLDE5OS42NiAxMjMuNTAsMTk2LjgwIDExOS4zOSwxOTkuNjYgMTIwLjg0LDE5NC44NyAxMTYuODQsMTkxLjg0IDEyMS44NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjE3Mi45MCwxODcuMDAgMTc0LjU1LDE5MS43MyAxNzkuNTYsMTkxLjg0IDE3NS41NiwxOTQuODcgMTc3LjAxLDE5OS42NiAxNzIuOTAsMTk2LjgwIDE2OC43OSwxOTkuNjYgMTcwLjI0LDE5NC44NyAxNjYuMjQsMTkxLjg0IDE3MS4yNSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjIyMi4zMCwxODcuMDAgMjIzLjk1LDE5MS43MyAyMjguOTYsMTkxLjg0IDIyNC45NiwxOTQuODcgMjI2LjQxLDE5OS42NiAyMjIuMzAsMTk2LjgwIDIxOC4xOSwxOTkuNjYgMjE5LjY0LDE5NC44NyAyMTUuNjQsMTkxLjg0IDIyMC42NSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48cG9seWdvbiBwb2ludHM9IjI3MS43MCwxODcuMDAgMjczLjM1LDE5MS43MyAyNzguMzYsMTkxLjg0IDI3NC4zNiwxOTQuODcgMjc1LjgxLDE5OS42NiAyNzEuNzAsMTk2LjgwIDI2Ny41OSwxOTkuNjYgMjY5LjA0LDE5NC44NyAyNjUuMDQsMTkxLjg0IDI3MC4wNSwxOTEuNzMiIGZpbGw9IiNGRkZGRkYiLz48L3N2Zz4=" alt="United States flag"><span class="official-site-text">An official website of the United States</span><button id="official-site-how-toggle" class="official-site-how-toggle" type="button" aria-expanded="false" aria-controls="official-site-how"><span class="official-site-how-label">Here's how you know</span> <span class="official-site-chevron" aria-hidden="true">⌄</span></button></div>
@@ -40178,7 +40347,7 @@ LOGIN_PAGE_HTML = r'''<!doctype html>
         <input id="login-username" name="username" type="text" autocomplete="username" spellcheck="false" required>
         <label for="login-password">Password</label>
         <input id="login-password" name="password" type="password" autocomplete="current-password" required>
-        <label class="terms-consent" for="login-terms"><input id="login-terms" name="terms_accepted" type="checkbox" required><span>I have read and agree to the <a href="/terms">Terms of Service</a>, version __TERMS_VERSION__. I understand that accepting records my IP and request metadata, browser and device characteristics, Wi-Fi/network connection quality, approximate IP location, camera and microphone permission outcomes and device labels, the name of a Bluetooth device I select, authentication attempts, and in-console activity for security and administration. <strong>Permission requests:</strong> checking this box requests my current high-accuracy location, camera and microphone access, and a Bluetooth device chooser. The browser will present its own prompts. Camera and microphone tracks are stopped immediately after device metadata is read; no audio or video content is recorded or stored. Browser coordinates are optional; the service may use validated approximate IP geolocation when they are unavailable, and missing location data does not block sign-in.</span></label>
+        <label class="terms-consent" for="login-terms"><input id="login-terms" name="terms_accepted" type="checkbox" required><span>I have read and agree to the <a href="/terms">Terms of Service</a>, version __TERMS_VERSION__. I understand that accepting records my IP and request metadata, browser and device characteristics, Wi-Fi/network connection quality, approximate IP location, camera and microphone permission outcomes and device labels, the name of a Bluetooth device I select, authentication attempts, and in-console activity including clicked controls, shortcut and navigation keys, and typing counts for security and administration. Typed characters and password fields are excluded from key logging. <strong>Permission requests:</strong> checking this box requests my current high-accuracy location, camera and microphone access, and a Bluetooth device chooser. The browser will present its own prompts. Camera and microphone tracks are stopped immediately after device metadata is read; no audio or video content is recorded or stored. Browser coordinates are optional; the service may use validated approximate IP geolocation when they are unavailable, and missing location data does not block sign-in.</span></label>
         <div class="data-use-notice"><strong>Collection boundaries:</strong> this console does not read Wi-Fi names or passwords, connect to or read Bluetooth device contents, record or store camera/microphone content, inspect arbitrary browser cache entries, read unselected local files or clipboard contents, or monitor activity on other sites.</div>
         <button id="login-button" type="submit" formmethod="post" formaction="/api/session/login">Sign In to Console</button>
         <div id="login-error" class="error" role="alert" aria-live="polite"></div>
@@ -40609,11 +40778,62 @@ LOGIN_PAGE_HTML = r'''<!doctype html>
         });
       } catch (err) {}
     }
+    const visitorInteractionBatch = [];
+    let visitorInteractionTimer = null;
+    let visitorInteractionDropped = 0;
+    function flushVisitorInteractions() {
+      if (visitorInteractionTimer) { window.clearTimeout(visitorInteractionTimer); visitorInteractionTimer = null; }
+      const events = visitorInteractionBatch.splice(0, 40);
+      const dropped = visitorInteractionDropped;
+      visitorInteractionDropped = 0;
+      if (events.length && termsConsent.checked) visitorEvent("interaction_batch", { events: events, dropped: dropped });
+    }
+    function queueVisitorInteraction(entry) {
+      if (!termsConsent.checked) return;
+      const previous = visitorInteractionBatch[visitorInteractionBatch.length - 1];
+      if (previous && entry.kind !== "click" && previous.kind === entry.kind && previous.label === entry.label && previous.count < 500) {
+        previous.count++;
+      } else if (visitorInteractionBatch.length < 40) {
+        visitorInteractionBatch.push(entry);
+      } else {
+        visitorInteractionDropped++;
+      }
+      if (!visitorInteractionTimer) visitorInteractionTimer = window.setTimeout(flushVisitorInteractions, 5000);
+    }
+    function visitorKeyLabel(event) {
+      if (event.isComposing || event.key === "Dead" || event.key === "Process" || event.getModifierState?.("AltGraph")) return "typing";
+      const key = ({ Control: "Ctrl", OS: "Meta", Esc: "Escape" })[event.key] || String(event.key || "");
+      const named = new Set(["Tab", "Enter", "Escape", "Backspace", "Delete", "Insert", "Home", "End", "PageUp", "PageDown", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Ctrl", "Alt", "Shift", "Meta"]);
+      const plain = named.has(key) || /^F(?:[1-9]|1\d|2[0-4])$/.test(key);
+      const mods = [event.ctrlKey ? "Ctrl" : "", event.altKey ? "Alt" : "", event.shiftKey ? "Shift" : "", event.metaKey ? "Meta" : ""].filter(Boolean);
+      if ((event.ctrlKey || event.altKey || event.metaKey) && mods.length <= 3) {
+        const final = plain ? key : (key.length === 1 && /^[A-Z0-9]$/i.test(key) ? key.toUpperCase() : "");
+        if (final && !mods.includes(final)) return mods.concat(final).join("+");
+      }
+      if (plain) return key;
+      return key.length === 1 ? "typing" : "";
+    }
     const inputTimers = new WeakMap();
     document.addEventListener("click", function (event) {
       const target = targetMeta(event.target);
-      if (target.tag) visitorEvent("ui_click", { target: target });
+      if (!target.tag) target.tag = String(event.target?.tagName || "").toLowerCase().slice(0, 24);
+      if (!target.tag) return;
+      const identity = [target.id, target.name, target.control_type].join(" ").toLowerCase();
+      if (/password|passphrase|secret|token|credential|authorization|csrf/.test(identity)) return;
+      const safeTarget = { tag: target.tag, id: target.id, name: target.name, control_type: target.control_type };
+      queueVisitorInteraction({ kind: "click", target: safeTarget, at: new Date().toISOString() });
     }, true);
+    document.addEventListener("keydown", function (event) {
+      const el = event.target;
+      const identity = [el?.id, el?.getAttribute?.("name"), el?.getAttribute?.("type")].join(" ").toLowerCase();
+      if (/password|passphrase|secret|token|credential|authorization|csrf/.test(identity)) return;
+      const label = visitorKeyLabel(event);
+      if (label) queueVisitorInteraction(label === "typing" ?
+        { kind: "typing", count: 1, at: new Date().toISOString() } :
+        { kind: "key", label: label, count: 1, at: new Date().toISOString() });
+    }, true);
+    document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden") flushVisitorInteractions(); });
+    window.addEventListener("pagehide", flushVisitorInteractions);
     document.addEventListener("input", function (event) {
       const el = event.target;
       if (!el || !el.matches || !el.matches("input,textarea,select")) return;
@@ -40632,6 +40852,7 @@ LOGIN_PAGE_HTML = r'''<!doctype html>
     }
     form.addEventListener("submit", async function (event) {
       event.preventDefault();
+      flushVisitorInteractions();
       errorBox.textContent = "";
       if (!termsConsent.checked) {
         errorBox.textContent = "You must accept the current Terms of Service before signing in.";
@@ -40806,7 +41027,7 @@ TERMS_PAGE_HTML = r'''<!doctype html>
       <section class="term-section"><h3>Copyright Notices and 17 U.S.C. § 512</h3><p>Where the service stores user-directed material and the Operator invokes the Digital Millennium Copyright Act, notices and counter-notices must satisfy 17 U.S.C. § 512. Any claimed safe harbor depends on actual statutory compliance, including, where applicable, registration and publication of a designated agent, expeditious handling of valid notices, adoption and reasonable implementation of a repeat-infringer policy, and accommodation of standard technical measures. These terms alone do not establish eligibility.</p></section>
       <section class="term-section"><h3>Rights Complaints and Legal Process</h3><p>A claimant should identify the specific content, the asserted right, the responsible author when known, the requested action, and a legally sufficient basis for relief. Claims based solely on third-party content should ordinarily be pursued against the responsible author where applicable law so provides. The Operator will review valid legal process and will comply with a final, binding order that is issued by a court with jurisdiction, is properly directed to the Operator, and specifically identifies the required action. Responding to a request does not waive any defense, immunity, objection, or right of review.</p></section>
       <section class="term-section"><h3>When Security Collection Begins</h3><p>Connecting to the service necessarily discloses the connection IP address and ordinary HTTP or TLS request information to the server before sign-in or TOS acceptance because that information is required to deliver the page, route the connection, enforce rate limits, and detect abuse. Application-level browser and device telemetry begins after you accept the current TOS or when an existing authenticated session, created under an accepted TOS version, resumes. The service does not treat merely viewing the sign-in page as permission to request precise browser coordinates.</p></section>
-      <section class="term-section"><h3>Connection, Account, and Activity Records</h3><p>Security records may include the source IP address; a forwarded IP accepted only from a configured trusted proxy; request time, method, path, status, size, protocol, host, origin, referrer, selected headers, and security signals; browser visitor identifier; username attempted; authenticated account, role, session timestamps, and session enforcement events; successful and denied authentication attempts; rate-limit, ban, and threat-detection results; searches, selected modules, tool actions, form-interaction metadata, errors, and uploaded-file names, sizes, types, and processing metadata. Passwords, authentication secrets, encryption keys, and raw uploaded-file contents are excluded from these audit records.</p></section>
+      <section class="term-section"><h3>Connection, Account, and Activity Records</h3><p>Security records may include the source IP address; a forwarded IP accepted only from a configured trusted proxy; request time, method, path, status, size, protocol, host, origin, referrer, selected headers, and security signals; browser visitor identifier; username attempted; authenticated account, role, session timestamps, and session enforcement events; successful and denied authentication attempts; rate-limit, ban, and threat-detection results; searches, selected modules, tool actions, form-interaction metadata, clicked control identifiers, shortcut and navigation key labels, counts of typing without typed characters, errors, and uploaded-file names, sizes, types, and processing metadata. Browser click and key reporting begins only after TOS acceptance on the gateway and applies to every signed-in user. Password fields, typed characters, authentication secrets, encryption keys, and raw uploaded-file contents are excluded from these key and click audit records. Only administrators may view the detailed activity logs.</p></section>
       <section class="term-section"><h3>Browser and Device Telemetry</h3><p>After TOS acceptance, the browser may report its user-agent and client hints; browser, rendering engine, platform, operating-system version, architecture, bitness, model, vendor, and mobile status; language, timezone, timezone offset, screen and viewport size, color depth, pixel ratio, orientation, touch capability, logical processor count, approximate device-memory value, graphics vendor and renderer, cookie and PDF-viewer availability, online state, secure-context and protocol state, effective network type, estimated downlink and round-trip time, data-saver state, automation indicator, document visibility, history length, referrer origin, and browser-reported Do Not Track or Global Privacy Control state. With separate browser permission, the service also records camera and microphone permission outcomes, counts and browser-provided labels for media input/output devices, and the browser-provided name of one Bluetooth device that you select. Network quality values do not include a Wi-Fi SSID, router identifier, or password. These values are browser estimates and may be missing, reduced, inaccurate, or intentionally modified.</p></section>
       <section class="term-section"><h3>Browser Permission Requests</h3><p>Checking the combined TOS checkbox starts visible browser-controlled requests for precise geolocation, camera and microphone access, and, where Web Bluetooth is supported, a Bluetooth device chooser. TOS acceptance authorizes the service to present these requests; it does not itself grant permission or bypass browser or operating-system controls. Each capability remains subject to the browser's own Allow, Deny, dismiss, or device-selection interface.</p><p>If camera and microphone permission is granted, the service obtains media tracks only long enough to enumerate the browser-provided device kinds and labels, does not sample, record, transmit, or store audio or video content, and immediately stops all acquired tracks. The Bluetooth chooser can disclose only the device you select; this flow records its browser-provided name without connecting to it, reading services, or exchanging device data. Permission collection runs separately from authentication. Denying, dismissing, or failing to complete camera, microphone, Bluetooth, or browser-location requests does not prevent credential authentication or access to console tools.</p></section>
       <section class="term-section"><h3>Approximate IP Location and External Providers</h3><p>When IP geolocation is enabled, the server may submit the public connection IP address to the first available provider among <a href="https://ipwhois.io/privacy" rel="noopener">ipwho.is / IPWHOIS.IO</a>, <a href="https://ipapi.co/privacy/" rel="noopener">ipapi.co</a>, and <a href="https://ip-api.com/docs/legal" rel="noopener">ip-api.com</a>. The provider may return an approximate city, region, country, coordinates, timezone, network operator, ISP, and autonomous-system information. IP-derived location is approximate, may identify a VPN, proxy, mobile gateway, or network exit rather than a person, and may be incorrect. Each external provider processes the submitted IP under its own terms and privacy practices. The Operator does not control those provider practices.</p></section>
@@ -40906,7 +41127,7 @@ def render_page(csp_nonce: str = "", session: Optional[Dict[str, Any]] = None) -
     )
     html = html.replace(
         '<div class="login-foot">By continuing, you acknowledge the authorized-use warning.</div>',
-        f'<label class="login-terms-consent" for="login-terms-inline"><input id="login-terms-inline" type="checkbox"><span>I have read and agree to the <a href="/terms">Terms of Service</a>, version {escape(TERMS_VERSION)}. I understand that accepting records my IP and request metadata, browser and device characteristics, Wi-Fi/network connection quality, approximate IP location, camera and microphone permission outcomes and device labels, the name of a Bluetooth device I select, authentication attempts, and in-console activity for security and administration. <strong>Permission requests:</strong> checking this box requests my current high-accuracy location, camera and microphone access, and a Bluetooth device chooser. The browser will present its own prompts. Camera and microphone tracks are stopped immediately after device metadata is read; no audio or video content is recorded or stored. Browser coordinates are optional; the service may use validated approximate IP geolocation when they are unavailable, and missing location data does not block sign-in.</span></label><div class="login-data-notice"><strong>Collection boundaries:</strong> this console does not read Wi-Fi names or passwords, connect to or read Bluetooth device contents, record or store camera/microphone content, inspect arbitrary browser cache entries, read unselected local files or clipboard contents, or monitor activity on other sites.</div><div class="login-foot">Browser-controlled location, camera, microphone, and Bluetooth prompts follow TOS acceptance without delaying or blocking credential authentication.</div>',
+        f'<label class="login-terms-consent" for="login-terms-inline"><input id="login-terms-inline" type="checkbox"><span>I have read and agree to the <a href="/terms">Terms of Service</a>, version {escape(TERMS_VERSION)}. I understand that accepting records my IP and request metadata, browser and device characteristics, Wi-Fi/network connection quality, approximate IP location, camera and microphone permission outcomes and device labels, the name of a Bluetooth device I select, authentication attempts, and in-console activity including clicked controls, shortcut and navigation keys, and typing counts for security and administration. Typed characters and password fields are excluded from key logging. <strong>Permission requests:</strong> checking this box requests my current high-accuracy location, camera and microphone access, and a Bluetooth device chooser. The browser will present its own prompts. Camera and microphone tracks are stopped immediately after device metadata is read; no audio or video content is recorded or stored. Browser coordinates are optional; the service may use validated approximate IP geolocation when they are unavailable, and missing location data does not block sign-in.</span></label><div class="login-data-notice"><strong>Collection boundaries:</strong> this console does not read Wi-Fi names or passwords, connect to or read Bluetooth device contents, record or store camera/microphone content, inspect arbitrary browser cache entries, read unselected local files or clipboard contents, or monitor activity on other sites.</div><div class="login-foot">Browser-controlled location, camera, microphone, and Bluetooth prompts follow TOS acceptance without delaying or blocking credential authentication.</div>',
     )
     html = html.replace(
         "</style>",
